@@ -20,9 +20,12 @@ import base64
 import urllib.error
 import urllib.request
 from pathlib import Path
+from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Optional
 
-from .draft import CardDraft
+from .draft import CardDraft, EDITABLE_FIELDS
+from .metrics import cost_krw
 from .vision_ocr import OcrResult, stage_timer
 
 SCHEMA_PATH = Path(__file__).resolve().parent / "card_schema.json"
@@ -38,6 +41,49 @@ OPENAI_KEY_FILES = ("~/.config/openai/credentials.env",)
 EXTRA_BIN_DIRS = ("~/.local/bin", "/opt/homebrew/bin", "/usr/local/bin")
 
 log = logging.getLogger("bizcard")
+_calls: ContextVar[Optional[list[dict]]] = ContextVar("parser_calls", default=None)
+
+
+@contextmanager
+def collect():
+    """Collect usage/cost for this operation, isolated from other chat workers."""
+    calls: list[dict] = []
+    token = _calls.set(calls)
+    try:
+        yield calls
+    finally:
+        _calls.reset(token)
+
+
+def _safe_usage(usage: dict) -> dict:
+    # Only documented numeric counters belong in statistics, never response text.
+    groups = {
+        "input_tokens_details": ("cached_tokens", "cache_write_tokens", "cache_creation_tokens"),
+        "output_tokens_details": ("reasoning_tokens",),
+        "cache_creation": ("ephemeral_1h_input_tokens", "ephemeral_5m_input_tokens"),
+    }
+    counters = ("input_tokens", "output_tokens", "total_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+    if not isinstance(usage, dict):
+        return {}
+    safe = {key: usage[key] for key in counters if isinstance(usage.get(key), (int, float))}
+    for group, keys in groups.items():
+        value = usage.get(group)
+        if isinstance(value, dict):
+            safe[group] = {key: value[key] for key in keys if isinstance(value.get(key), (int, float))}
+    details = usage.get("input_tokens_details") or {}
+    if isinstance(details, dict):
+        write = details.get("cache_write_tokens_details") or {}
+        if isinstance(write, dict) and isinstance(write.get("ttl_12h_tokens"), (int, float)):
+            safe.setdefault("input_tokens_details", {})["cache_write_tokens_details"] = {"ttl_12h_tokens": write["ttl_12h_tokens"]}
+    return safe
+
+
+def _record_call(provider: str, model: str, usage: dict) -> None:
+    calls = _calls.get()
+    if calls is not None:
+        calls.append({"provider": provider, "model": model, "usage": _safe_usage(usage),
+                      "krw": cost_krw(provider, model, usage)})
+
 
 FIELD_GUIDE = (
     "JSON 필드: name(사람 이름만, 직함 제외), title(명함에 적힌 직함 원문 그대로, 없으면 빈 문자열), "
@@ -170,7 +216,10 @@ def anthropic_api_key() -> str:
 def run_crosscheck(prompt: str, image_path: Path, ocr_text: str) -> Optional[dict]:
     from concurrent.futures import ThreadPoolExecutor
 
+    collector = _calls.get()
+
     def safe(fn, name):
+        token = _calls.set(collector)
         try:
             with stage_timer("luna" if name == "openai" else "haiku"):
                 model_prompt = prompt
@@ -186,6 +235,8 @@ def run_crosscheck(prompt: str, image_path: Path, ocr_text: str) -> Optional[dic
         except Exception as exc:
             log.warning("%s failed in cross-check: %s", name, exc)
             return None
+        finally:
+            _calls.reset(token)
 
     with ThreadPoolExecutor(max_workers=2) as pool:
         luna = pool.submit(safe, run_openai, "openai")
@@ -228,13 +279,18 @@ def run_anthropic(prompt: str, image_path: Optional[Path]) -> dict:
         with urllib.request.urlopen(request, timeout=parser_timeout()) as response:
             result = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
+        _record_call("anthropic", body["model"], {})
         body_text = exc.read().decode("utf-8", errors="replace")
         try:
             message = json.loads(body_text).get("error", {}).get("message") or body_text
         except (json.JSONDecodeError, AttributeError):
             message = body_text
         raise RuntimeError(f"Anthropic HTTP {exc.code}: {message[:300]}") from exc
+    except Exception:
+        _record_call("anthropic", body["model"], {})
+        raise
     usage = result.get("usage") or {}
+    _record_call("anthropic", body["model"], usage)
     log.info("anthropic model=%s tokens in=%s out=%s", result.get("model"), usage.get("input_tokens"), usage.get("output_tokens"))
     for block in result.get("content", []):
         if block.get("type") == "tool_use" and isinstance(block.get("input"), dict):
@@ -333,8 +389,42 @@ def crosscheck_merge(luna: dict, haiku: dict, ocr_text: str) -> dict:
     for field in ("email", "website"):
         extra = [v for v in haiku.get(field) or [] if _squash(v) not in {_squash(x) for x in merged[field]} and _squash(v) in ocr_squashed]
         merged[field] = merged[field] + extra
+    if os.environ.get("BIZCARD_ADDRESS_ARBITRATION", "on").strip().lower() not in ("off", "0", "false", "no"):
+        a, b = list(luna.get("address") or []), list(haiku.get("address") or [])
+        if a and b and not _addresses_related(a, b):
+            a_in, b_in = _address_supported(a, ocr_squashed), _address_supported(b, ocr_squashed)
+            if not a_in:
+                if b_in and len(b) >= len(a):
+                    merged["address"] = b
+                warnings.append(f"주소 판독이 엇갈림: {' / '.join(a)} / {' / '.join(b)}")
+    calls = _calls.get()
+    if calls:
+        calls[-1]["agree"] = _field_agreement(luna, haiku)
     merged["warnings"] = warnings
     return merged
+
+
+def _addresses_related(a: list[str], b: list[str]) -> bool:
+    # Compare each address; joining lists can hide a missing second location.
+    return (all(any(_related(x, y) for y in b) for x in a)
+            and all(any(_related(x, y) for x in a) for y in b))
+
+
+def _address_supported(addresses: list[str], ocr_squashed: str) -> bool:
+    tokens = [_squash(token) for address in addresses for token in re.split(r"[\s,]+", address)]
+    tokens = [token for token in tokens if len(token) >= 2]
+    return bool(tokens) and all(token in ocr_squashed for token in tokens)
+
+
+def _field_agreement(luna: dict, haiku: dict) -> dict[str, bool]:
+    def normalized(field, data):
+        value = data.get(field)
+        if field in ("mobile", "work", "fax"):
+            return {_digits(item) for item in value or [] if _digits(item)}
+        if isinstance(value, list):
+            return {_squash(item) for item in value if _squash(item)}
+        return _squash(value or "")
+    return {field: normalized(field, luna) == normalized(field, haiku) for field in EDITABLE_FIELDS}
 
 
 def merge_drafts(front: CardDraft, back: CardDraft) -> CardDraft:
@@ -370,6 +460,9 @@ def run_backend(prompt: str, image_path: Optional[Path] = None) -> Optional[dict
         try:
             if backend == "openai":
                 return run_openai(prompt, image_path)
+            model = (os.environ.get("BIZCARD_CODEX_MODEL", DEFAULT_CODEX_MODEL) if backend == "codex"
+                     else os.environ.get("BIZCARD_CLAUDE_MODEL", DEFAULT_CLAUDE_MODEL))
+            _record_call(backend, model, {})
             output = run_codex(prompt, image_path) if backend == "codex" else run_claude(prompt, image_path)
         except Exception as exc:
             log.warning("%s parser failed: %s", backend, exc)
@@ -402,9 +495,10 @@ def run_openai(prompt: str, image_path: Optional[Path]) -> dict:
     key = openai_api_key()
     if not key:
         raise RuntimeError("OpenAI API key not found")
+    body = openai_request_body(prompt, image_path)
     request = urllib.request.Request(
         OPENAI_RESPONSES_URL,
-        data=json.dumps(openai_request_body(prompt, image_path)).encode("utf-8"),
+        data=json.dumps(body).encode("utf-8"),
         headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
         method="POST",
     )
@@ -412,13 +506,18 @@ def run_openai(prompt: str, image_path: Optional[Path]) -> dict:
         with urllib.request.urlopen(request, timeout=parser_timeout()) as response:
             result = json.loads(response.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
+        _record_call("openai", body["model"], {})
         body = exc.read().decode("utf-8", errors="replace")
         try:
             message = json.loads(body).get("error", {}).get("message") or body
         except (json.JSONDecodeError, AttributeError):
             message = body
         raise RuntimeError(f"OpenAI HTTP {exc.code}: {message[:300]}") from exc
+    except Exception:
+        _record_call("openai", body["model"], {})
+        raise
     usage = result.get("usage") or {}
+    _record_call("openai", body["model"], usage)
     log.info(
         "openai model=%s tokens in=%s out=%s reasoning=%s",
         result.get("model"), usage.get("input_tokens"), usage.get("output_tokens"),

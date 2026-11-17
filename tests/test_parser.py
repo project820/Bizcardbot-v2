@@ -223,5 +223,154 @@ class CrossCheckTest(unittest.TestCase):
         self.assertEqual(seen["body"]["tool_choice"], {"type": "tool", "name": "business_card"})
 
 
+class AddressArbitrationTest(unittest.TestCase):
+    def merge(self, luna, haiku, ocr):
+        return parser.crosscheck_merge({'address': luna}, {'address': haiku}, ocr)
+
+    def test_ocr_supported_haiku_replaces_luna_typo(self):
+        result = self.merge(['테스트시 가상로 11'], ['테스트시 가상로 12'], '테스트시 가상로 12')
+        self.assertEqual(result['address'], ['테스트시 가상로 12'])
+        self.assertTrue(any('주소 판독이 엇갈림' in w for w in result['warnings']))
+
+    def test_other_disagreement_keeps_luna_and_warns(self):
+        result = self.merge(['테스트시 가상로 11'], ['테스트시 다른로 12'], '')
+        self.assertEqual(result['address'], ['테스트시 가상로 11'])
+        self.assertTrue(any('주소 판독이 엇갈림' in w for w in result['warnings']))
+
+    def test_haiku_cannot_drop_an_address(self):
+        result = self.merge(['테스트시 가상로 11', '다른시 다른로 22'], ['테스트시 가상로 12'], '테스트시 가상로 12')
+        self.assertEqual(len(result['address']), 2)
+
+    def test_ocr_supported_luna_is_kept_without_warning(self):
+        result = self.merge(['테스트시 가상로 11'], ['테스트시 가상로 12'], '테스트시 가상로 11')
+        self.assertEqual(result['address'], ['테스트시 가상로 11'])
+        self.assertFalse(result['warnings'])
+
+    def test_empty_related_and_reordered_addresses_do_not_warn(self):
+        for a, b in [([], ['테스트로 12']), (['테스트로 12'], []),
+                     (['테스트시 가상로 12'], ['주소: 테스트시, 가상로 12']),
+                     (['테스트로 12', '다른로 34'], ['다른로 34', '테스트로 12'])]:
+            with self.subTest(luna=a, haiku=b):
+                self.assertFalse(self.merge(a, b, '')['warnings'])
+
+    def test_off_retains_old_merge_without_address_warning(self):
+        with patch.dict(os.environ, {'BIZCARD_ADDRESS_ARBITRATION': 'off'}):
+            result = self.merge(['테스트로 11'], ['테스트로 12'], '테스트로 12')
+        self.assertEqual(result['address'], ['테스트로 11'])
+        self.assertFalse(result['warnings'])
+
+
+class CollectionTest(unittest.TestCase):
+    def response(self, provider):
+        import io
+        import json
+        payload = {'usage': {'input_tokens': 1000, 'output_tokens': 200}}
+        if provider == 'openai':
+            payload.update(model='gpt-6-luna', output=[{'content': [{'type': 'output_text', 'text': '{"name":"Example","address":["테스트로 12"]}'}]}])
+        else:
+            payload.update(model='claude-haiku-5-5', content=[{'type': 'tool_use', 'input': {'name': 'Example', 'address': ['테스트로 13']}}])
+        return io.BytesIO(json.dumps(payload).encode())
+
+    def test_crosscheck_captures_parallel_usage_and_agreement_without_values(self):
+        import json
+        def response(request, **kwargs):
+            return self.response('openai' if request.full_url == parser.OPENAI_RESPONSES_URL else 'anthropic')
+        with patch.object(parser, 'openai_api_key', return_value='test'), \
+             patch.object(parser, 'anthropic_api_key', return_value='test'), \
+             patch.object(parser.urllib.request, 'urlopen', response):
+            with parser.collect() as calls:
+                result = parser.run_crosscheck('private-prompt', None, '테스트로 12')
+        self.assertEqual(len(calls), 2)
+        self.assertEqual({c['provider'] for c in calls}, {'openai', 'anthropic'})
+        self.assertTrue(all(c['krw'] > 0 for c in calls))
+        agree = next(c['agree'] for c in calls if 'agree' in c)
+        self.assertTrue(agree['name'])
+        self.assertFalse(agree['address'])
+        self.assertNotIn('Example', json.dumps(calls))
+        self.assertNotIn('private-prompt', json.dumps(calls))
+        self.assertEqual(result['name'], 'Example')
+
+    def test_nested_collectors_restore_outer_after_exception(self):
+        with patch.object(parser, 'openai_api_key', return_value='test'), \
+             patch.object(parser.urllib.request, 'urlopen', side_effect=lambda *a, **k: self.response('openai')):
+            with parser.collect() as outer:
+                parser.run_openai('p', None)
+                with self.assertRaises(ValueError):
+                    with parser.collect() as inner:
+                        parser.run_openai('p', None)
+                        raise ValueError('test')
+                parser.run_openai('p', None)
+        self.assertEqual(len(outer), 2)
+        self.assertEqual(len(inner), 1)
+
+    def test_cli_fallback_is_recorded_as_unknown(self):
+        with patch.object(parser, 'backend_name', return_value='codex'), \
+             patch.object(parser, 'run_codex', return_value='{"name":"Example"}'):
+            with parser.collect() as calls:
+                self.assertEqual(parser.run_backend('p')['name'], 'Example')
+        self.assertEqual(len(calls), 1)
+        self.assertIsNone(calls[0]['krw'])
+        self.assertEqual(calls[0]['provider'], 'codex')
+
+    def test_requested_model_is_used_when_response_has_dated_model(self):
+        import io
+        import json
+        payload = {'model': 'gpt-6-luna-2026-11-18', 'usage': {'input_tokens': 1000, 'output_tokens': 200},
+                   'output': [{'content': [{'type': 'output_text', 'text': '{"name":"Example"}'}]}]}
+        with patch.object(parser, 'openai_api_key', return_value='test'), \
+             patch.dict(os.environ, {'BIZCARD_OPENAI_MODEL': 'gpt-6-luna'}), \
+             patch.object(parser.urllib.request, 'urlopen', side_effect=lambda *a, **k: io.BytesIO(json.dumps(payload).encode())):
+            with parser.collect() as calls:
+                parser.run_openai('p', None)
+        self.assertEqual(calls[0]['model'], 'gpt-6-luna')
+        self.assertAlmostEqual(calls[0]['krw'], .267)
+
+    def test_failed_api_alongside_success_keeps_cost_unknown(self):
+        import urllib.error
+        def response(request, **kwargs):
+            if request.full_url == parser.OPENAI_RESPONSES_URL:
+                raise urllib.error.URLError('offline')
+            return self.response('anthropic')
+        with patch.object(parser, 'openai_api_key', return_value='test'), \
+             patch.object(parser, 'anthropic_api_key', return_value='test'), \
+             patch.object(parser.urllib.request, 'urlopen', response):
+            with parser.collect() as calls:
+                result = parser.run_crosscheck('p', None, '')
+        self.assertEqual(result['name'], 'Example')
+        self.assertEqual(len(calls), 2)
+        self.assertIsNone(next(c['krw'] for c in calls if c['provider'] == 'openai'))
+
+    def test_usage_collector_rejects_unexpected_value_fields(self):
+        import io
+        import json
+        payload = {'usage': {'input_tokens': 1000, 'output_tokens': 200, 'private': 'Example'},
+                   'output': [{'content': [{'type': 'output_text', 'text': '{"name":"Example"}'}]}]}
+        with patch.object(parser, 'openai_api_key', return_value='test'), \
+             patch.object(parser.urllib.request, 'urlopen', side_effect=lambda *a, **k: io.BytesIO(json.dumps(payload).encode())):
+            with parser.collect() as calls:
+                parser.run_openai('p', None)
+        self.assertNotIn('Example', json.dumps(calls))
+        self.assertEqual(calls[0]['usage'], {'input_tokens': 1000, 'output_tokens': 200})
+
+    def test_simultaneous_collectors_do_not_share_usage(self):
+        import threading
+        from concurrent.futures import ThreadPoolExecutor
+        barrier = threading.Barrier(2, timeout=2)
+        def response(request, **kwargs):
+            barrier.wait()
+            return self.response('openai')
+        def scan(index):
+            with parser.collect() as calls:
+                parser.run_openai('p', None)
+            return calls
+        with patch.object(parser, 'openai_api_key', return_value='test'), \
+             patch.object(parser.urllib.request, 'urlopen', response):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                one, two = list(pool.map(scan, range(2)))
+        self.assertEqual(len(one), 1)
+        self.assertEqual(len(two), 1)
+        self.assertIsNot(one, two)
+
+
 if __name__ == "__main__":
     unittest.main()
