@@ -14,6 +14,8 @@ import sys
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
 UNRELEASED = re.compile(r"^## \[Unreleased\][ \t]*$", re.MULTILINE)
+REPO_BLOB_URL = "https://github.com/project820/Bizcardbot-v2/blob"
+RELATIVE_LINK = re.compile(r"\]\((?![a-z][a-z0-9+.-]*:|#|/)([^)\s]+)\)", re.IGNORECASE)
 PERSONAL_DOMAINS = (
     "gmail.com", "googlemail.com", "naver.com", "daum.net", "hanmail.net",
     "nate.com", "kakao.com", "outlook.com", "hotmail.com", "live.com",
@@ -61,6 +63,11 @@ def read_version(root):
     if len(values) != 1 or not re.fullmatch(VERSION, values[0]):
         raise ReleaseError("bizcard_intake/__init__.py: __version__은 X.Y.Z 문자열 하나여야 한다")
     return values[0]
+
+
+def absolute_links(text, version):
+    """GitHub release bodies cannot resolve repository-relative links; pin them to the tag."""
+    return RELATIVE_LINK.sub(lambda m: f"]({REPO_BLOB_URL}/v{version}/{m.group(1).removeprefix('./')})", text)
 
 
 def release_section(changelog, version):
@@ -152,8 +159,8 @@ def fixture_mobile(value):
         digits = "0" + digits[4:].lstrip("0")
     elif digits.startswith("82"):
         digits = "0" + digits[2:].lstrip("0")
-    synthetic = ("01012345678", "01000000000", "01011112222", "01099990000")
-    return digits in synthetic or bool(re.fullmatch(r"01055550\d{3}", digits))
+    synthetic = ("01012345678", "01011112222", "01099990000")
+    return digits in synthetic or bool(re.fullmatch(r"01055550\d{3}|010(?:0{7})\d", digits))
 
 
 def scan_history(root):
@@ -268,7 +275,8 @@ def main(argv=None, *, root=ROOT):
                 return 1
             print("PASS: Git 이력 검사를 통과했다")
         elif args.command == "notes":
-            print(release_section((root / "CHANGELOG.md").read_text(encoding="utf-8"), args.version), end="")
+            section = release_section((root / "CHANGELOG.md").read_text(encoding="utf-8"), args.version)
+            print(absolute_links(section, args.version), end="")
         else:
             print(f"v{bump(root, args.part)}: README와 관련 문서를 갱신한 뒤 check로 확인한다")
     except ReleaseError as error:

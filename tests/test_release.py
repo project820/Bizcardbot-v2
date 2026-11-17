@@ -277,6 +277,14 @@ class ReleaseTest(unittest.TestCase):
         self.assertNotIn("Unreleased", output)
         self.assertNotIn("1.0.0", output)
 
+    def test_notes_pin_relative_links_to_the_tag(self):
+        module = self.module()
+        text = "[a](.env.example) [b](./docs/x.md) [c](https://x.example/y) [d](#top)"
+        self.assertEqual(module.absolute_links(text, "2.1.1"),
+                         "[a](https://github.com/project820/Bizcardbot-v2/blob/v2.1.1/.env.example) "
+                         "[b](https://github.com/project820/Bizcardbot-v2/blob/v2.1.1/docs/x.md) "
+                         "[c](https://x.example/y) [d](#top)")
+
     def test_notes_reject_missing_or_invalid_version(self):
         for version in ("9.0.0", "../README", "02.0.0"):
             with self.subTest(version=version):
