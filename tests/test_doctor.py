@@ -75,7 +75,7 @@ class DoctorTest(unittest.TestCase):
         self.assertIn("해결: do this", report)
 
     def test_default_checks_cover_only_telegram_dependencies(self):
-        expected = ["python", "vision", "gws", "parser", "telegram"]
+        expected = ["python", "vision", "gws", "parser", "telegram", "timezone", "writer"]
         self.assertEqual(list(doctor.CHECKS), expected)
         callbacks = {name: (lambda name=name: doctor.Check(name, True, "ok"))
                      for name in expected}

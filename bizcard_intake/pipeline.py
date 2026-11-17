@@ -8,6 +8,7 @@ unapproved draft save itself.
 
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import secrets
@@ -16,6 +17,7 @@ import tempfile
 import time
 from collections import defaultdict
 from contextlib import contextmanager
+from functools import wraps
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -122,16 +124,55 @@ _card_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
 
 
 @contextmanager
-def card_lock(card_id: str, *, blocking: bool = True):
+def card_lock(card_id: str, *, blocking: bool = True, timeout: float = -1):
     """Serialize saves, edits and cancellation for a card across channel workers."""
     with _locks_guard:
         lock = _card_locks[card_id]
-    acquired = lock.acquire(blocking=blocking)
+    acquired = lock.acquire(blocking=blocking, timeout=timeout)
     try:
         yield acquired
     finally:
         if acquired:
             lock.release()
+
+
+def stale_safe(result_kind: str):
+    """Translate refused writes at operation boundaries; never replay a save.
+
+    Normal writers reload under card_lock. This also handles delayed input and
+    a second session modifying storage: refresh the caller and report refusal.
+    """
+    def decorate(function):
+        @wraps(function)
+        def wrapped(*args, **kwargs):
+            try:
+                return function(*args, **kwargs)
+            except cards.StaleCardState as exc:
+                for value in args:
+                    if isinstance(value, dict) and value.get("id"):
+                        fresh = cards.load_card(value["id"])
+                        if fresh:
+                            value.clear()
+                            value.update(fresh)
+                message = "저장 상태가 변경되어 요청을 반영하지 않았습니다. 이전 저장 결과를 확인한 뒤 다시 시도하세요."
+                log.warning("card write refused operation=%s", function.__name__)
+                if result_kind == "edit":
+                    return False, message
+                if result_kind == "bool":
+                    return False
+                if result_kind == "token":
+                    return ""
+                if result_kind == "scan":
+                    return 0, [message]
+                if result_kind == "notes":
+                    return [message]
+                if result_kind == "none":
+                    return None
+                if result_kind == "photo":
+                    raise ContactSaveError(message + " 사진을 다시 보내주세요.", kind="invalid") from exc
+                return {"ok": False, "stale": True, "message": message}
+        return wrapped
+    return decorate
 
 
 def profile_image_path(source_path: Path) -> Path:
@@ -142,10 +183,59 @@ def current_draft(card: dict) -> CardDraft:
     return CardDraft.from_session_value(card.get("draft"))
 
 
+def unresolved_save(card: dict) -> bool:
+    return bool(card.get("save_intent")) and card.get("status") not in ("saved", "cancelled")
+
+
 def set_draft(card: dict, draft: CardDraft, event: str) -> None:
+    if unresolved_save(card):
+        raise ContactSaveError("이전 저장 결과를 먼저 확인하세요. 확인 전에는 초안을 수정할 수 없습니다.", kind="invalid")
     card["draft"] = draft.to_dict()
+    card.pop("job_change_lookup_key", None)
+    card.pop("job_choice", None)
+    card["job_change"] = None
+    card["job_change_pending"] = False
+    card.pop("job_change_started_at", None)
+    card.pop("job_change_lookup_id", None)
     card["revision"] = int(card.get("revision") or 0) + 1
     cards.add_history(card, event, draft.display_name)
+
+
+JOB_CHANGE_STALE_SECONDS = 20.0
+
+
+def job_change_pending_active(card: dict) -> bool:
+    if not card.get("job_change_pending"):
+        return False
+    started = card.get("job_change_started_at")
+    if started is None:
+        return False
+    return isinstance(started, (int, float)) and time.time() - started < JOB_CHANGE_STALE_SECONDS
+
+
+def refresh_job_change(card: dict) -> None:
+    """Cache read-only matching (including failures) until relevant draft fields change."""
+    if unresolved_save(card):
+        return
+    draft = current_draft(card)
+    key = [draft.name, draft.company, draft.title, draft.mobile, draft.email,
+           _os.environ.get("BIZCARD_CONTACTS_BACKEND", "google"),
+           _os.environ.get("BIZCARD_APPLE_CONTAINER", "")]
+    if card.get("job_change_lookup_key") == key:
+        return
+    card["job_change_lookup_key"] = key
+    card["job_change"] = None
+    card.pop("job_choice", None)
+    try:
+        person = contact_backend.find_job_change_candidate(draft)
+        if person:
+            org = (person.get("organizations") or [{}])[0]
+            card["job_change"] = {"resource_name": person["resourceName"],
+                                  "company": org.get("name", ""), "title": org.get("title", ""),
+                                  "container": person.get("_container")}
+    except Exception:
+        # Neither raw helper errors nor contact data belong in this optional log.
+        log.warning("job-change lookup unavailable card=%s", card["id"])
 
 
 # ---------------------------------------------------------------- recognition
@@ -171,12 +261,86 @@ def scan_front(front_path: Path) -> dict:
     return {"images": images, "rectifier": prepared.source_used, "draft": draft}
 
 
+BUSY_MESSAGE = "처리 중입니다. 잠시 후 다시 눌러 주세요."
+
+
+def cancel_path(card_id: str) -> Path:
+    return cards.CARD_DIR.parent / "cancel" / card_id
+
+
+def request_cancel(card: dict) -> None:
+    # Separate durable mailbox: never wait for the busy card's write lock.
+    cards._atomic_write(cancel_path(card["id"]), "cancel_requested")
+    card["cancel_requested"] = True
+
+
+def _recognize(card: dict, side: str, work, *args) -> dict:
+    with card_lock(card["id"]):
+        if not _refresh_for_change(card, allow_processing=True):
+            raise ContactSaveError("이전 저장 결과를 먼저 확인하세요. 사진을 반영하지 않았습니다. 확인 후 다시 보내주세요.", kind="invalid")
+        if cancel_path(card["id"]).exists():
+            _cancel_locked(card)
+            return card
+        if card.get("recognition_id"):
+            raise ContactSaveError(BUSY_MESSAGE, kind="invalid")
+        operation = secrets.token_hex(8)
+        card.update(status="processing", recognition_id=operation)
+        if args and args[0] is not None:
+            card["images"][side] = str(args[0])
+        if side == "back":
+            card["awaiting_back"] = False
+        cards.save_card(card)
+        version = card.get("_save_state_version", 0)
+        revision = card.get("revision")
+        snapshot = copy.deepcopy(card)
+    completed = False
+    try:
+        # OCR, parsing, merging and image preparation run without a card lock.
+        work(snapshot, *args)
+        completed = True
+    finally:
+        with card_lock(card["id"]):
+            fresh = cards.load_card(card["id"])
+            if fresh:
+                owns = (fresh.get("recognition_id") == operation
+                        and fresh.get("status") == "processing"
+                        and fresh.get("revision") == revision
+                        and fresh.get("_save_state_version", 0) == version
+                        and not unresolved_save(fresh))
+                if owns:
+                    # Preserve message/reminder metadata written during OCR.
+                    fields = ("images", "rectifier", "draft", "front_draft", "back_draft",
+                              "recognition_error", "revision", "awaiting_back", "job_change",
+                              "job_choice", "job_change_lookup_key", "job_change_pending")
+                    if completed:
+                        for key in fields:
+                            if key in snapshot:
+                                fresh[key] = snapshot[key]
+                            else:
+                                fresh.pop(key, None)
+                    fresh.pop("recognition_id", None)
+                    fresh["status"] = "review"
+                    if cancel_path(fresh["id"]).exists():
+                        _cancel_locked(fresh)
+                    else:
+                        cards.add_history(fresh, "recognized")
+                        cards.save_card(fresh)
+                elif cancel_path(fresh["id"]).exists():
+                    _cancel_locked(fresh)
+                card.clear()
+                card.update(fresh)
+    return card
+
+
+@stale_safe("photo")
 def recognize_front(card: dict, front_path: Optional[Path] = None) -> dict:
+    return _recognize(card, "front", _recognize_front_work, front_path)
+
+
+def _recognize_front_work(card: dict, front_path: Optional[Path] = None) -> dict:
     """Fill the card from its front photo. A failure still leaves a reviewable card."""
     front = Path(front_path or card["images"]["front"])
     card["images"]["front"] = str(front)
-    card["status"] = "processing"
-    cards.save_card(card)
     previous = current_draft(card)
     try:
         result = scan_front(front)
@@ -192,11 +356,15 @@ def recognize_front(card: dict, front_path: Optional[Path] = None) -> dict:
         card["recognition_error"] = None
     set_draft(card, draft, "recognized")
     card["status"] = "review"
-    cards.save_card(card)
     return card
 
 
+@stale_safe("photo")
 def recognize_back(card: dict, back_path: Path) -> dict:
+    return _recognize(card, "back", _recognize_back_work, back_path)
+
+
+def _recognize_back_work(card: dict, back_path: Path) -> dict:
     card["images"]["back"] = str(back_path)
     card["awaiting_back"] = False
     previous = current_draft(card)
@@ -216,16 +384,22 @@ def recognize_back(card: dict, back_path: Path) -> dict:
         merged.warnings.append(f"뒷면 인식 실패: {str(exc)[:80]}")
     set_draft(card, preserve_locked(merged, previous), "back_merged")
     card["status"] = "review"
-    cards.save_card(card)
     return card
 
 
 # ---------------------------------------------------------------- editing
 
+@stale_safe("edit")
 def edit(card: dict, text: str) -> tuple[bool, str]:
     """Apply a reply. '필드: 값' lines are applied directly; free text goes to the AI reviser."""
-    with card_lock(card["id"]):
+    with card_lock(card["id"], blocking=False) as acquired:
+        if not acquired:
+            return False, BUSY_MESSAGE
         if not _refresh_for_change(card):
+            if card.get("status") in ("processing", "saving"):
+                return False, BUSY_MESSAGE
+            if unresolved_save(card):
+                return False, "이전 저장 결과를 먼저 확인하세요. 확인 전에는 초안을 수정할 수 없습니다."
             return False, "저장이 시작되었거나 종료되어 수정하지 못했습니다."
         return _edit_locked(card, text)
 
@@ -238,7 +412,7 @@ def _refresh_for_change(card: dict, *, allow_processing: bool = False) -> bool:
     card.clear()
     card.update(fresh)
     allowed = cards.REVIEW_STATUSES + (("processing",) if allow_processing else ())
-    return (card.get("status") in allowed
+    return (not unresolved_save(card) and card.get("status") in allowed
             and int(card.get("save_attempts") or 0) == attempts)
 
 
@@ -270,27 +444,55 @@ def _reopen_for_review(card: dict) -> None:
 
 # ---------------------------------------------------------------- saving
 
-def approve(card: dict, revision: Optional[int] = None) -> dict:
+@stale_safe("outcome")
+def approve(card: dict, revision: Optional[int] = None, *, job_choice: Optional[str] = None) -> dict:
     """Save the approved revision. Returns a result dict for the channel to render."""
-    with card_lock(card["id"]):
+    with card_lock(card["id"], blocking=False) as acquired:
+        if not acquired:
+            return {"ok": False, "busy": True, "message": BUSY_MESSAGE}
         fresh = cards.load_card(card["id"])
         if fresh is not None:
             card.clear()
             card.update(fresh)
-        return _approve_locked(card, revision)
+        return _approve_locked(card, revision, job_choice)
 
 
-def _approve_locked(card: dict, revision: Optional[int]) -> dict:
+def _approve_locked(card: dict, revision: Optional[int], job_choice: Optional[str] = None) -> dict:
+    if card.get("status") in ("processing", "saving"):
+        return {"ok": False, "busy": True, "message": BUSY_MESSAGE}
     if card.get("status") == "saved":
         return {"ok": True, "already": True, "message": f"이미 저장된 명함입니다: {current_draft(card).display_name}"}
     if card.get("status") not in cards.REVIEW_STATUSES:
         return {"ok": False, "message": "지금은 저장할 수 없는 상태입니다. 잠시 후 다시 눌러주세요."}
     if revision is not None and int(revision) != int(card.get("revision") or 0):
         return {"ok": False, "stale": True, "message": "초안이 그 사이 수정되었습니다. 가장 최근 초안의 '저장' 버튼을 눌러주세요."}
+    if unresolved_save(card):
+        intent = card["save_intent"]
+        recorded_choice = {"update": "update", "create": "new"}.get(intent.get("op"))
+        if job_choice and job_choice != recorded_choice:
+            return {"ok": False, "invalid": True,
+                    "message": "이전 저장 작업이 아직 확인되지 않았습니다. 저장 결과를 먼저 확인하세요."}
+        # The durable operation is authoritative even if old UI metadata was lost.
+        return _save(card)
+    if card.get("job_change_pending"):
+        if job_change_pending_active(card):
+            return {"ok": False, "invalid": True, "message": "기존 연락처를 확인 중입니다. 잠시 후 저장 버튼을 눌러주세요."}
+        card.update(job_change_pending=False, job_change=None, job_change_lookup_key=None)
+        card.pop("job_change_started_at", None)
+        card.pop("job_change_lookup_id", None)
+        card.pop("job_choice", None)
+        cards.save_card(card)
     draft = current_draft(card)
     missing = draft.missing_for_save()
     if missing:
         return {"ok": False, "invalid": True, "message": f"저장하려면 {', '.join(missing)}이(가) 필요합니다. '직접 수정'으로 입력해주세요."}
+    if card.get("job_change"):
+        if job_choice not in ("update", "new") and card.get("job_choice") not in ("update", "new"):
+            return {"ok": False, "invalid": True, "message": "기존 연락처 갱신 또는 새 연락처로 저장을 선택하세요."}
+        if job_choice:
+            card["job_choice"] = job_choice
+    elif job_choice:
+        return {"ok": False, "stale": True, "message": "최근 초안의 저장 버튼을 눌러주세요."}
     card["approved_revision"] = card.get("revision")
     cards.add_history(card, "approved", str(card["approved_revision"]))
     return _save(card)
@@ -299,10 +501,12 @@ def _approve_locked(card: dict, revision: Optional[int]) -> dict:
 def _persist_save_fields(card: dict, *fields: str, event: str = "", detail: str = "") -> None:
     """Merge worker-owned fields into fresh state while the caller holds card_lock.
 
-    Keep UI metadata and its current Apple version; never copy a stale card over
+    Keep UI metadata and its current save-state version; never copy a stale card over
     the journal. The normal save_card operation/nonce guards still apply.
     """
     fresh = cards.load_card(card["id"]) or dict(card)
+    if fresh.get("_save_state_version", 0) != card.get("_save_state_version", 0):
+        raise cards.StaleCardState("저장 작업의 상태가 변경되었습니다. 이전 저장 결과를 확인하세요.")
     for field in fields:
         if field in card:
             fresh[field] = card[field]
@@ -338,6 +542,9 @@ def _save(card: dict, *, new_operation: bool = False) -> dict:
     try:
         kwargs = {}
         intent = card.get("save_intent")
+        resource_name = card.get("resource_name")
+        if card.get("job_choice") == "update" and not intent and not resource_name:
+            resource_name = card["job_change"]["resource_name"]
         if not intent and not card.get("resource_name") and card.get("error_kind") == "unknown_outcome" and contact_backend.backend_name() == "apple":
             selected = apple_contacts.container_id() or apple_contacts.run_helper("containers").get("defaultIdentifier", "")
             if not selected:
@@ -346,13 +553,19 @@ def _save(card: dict, *, new_operation: bool = False) -> dict:
                                "target_identifier": None, "fingerprint": apple_contacts.fingerprint(draft),
                                "identifiers": [], "generation": 1, "legacy_untracked": True})
             raise apple_contacts.ConfirmationRequired()
-        if (intent and intent.get("backend") == "apple") or (
-                (card.get("resource_name") or "").startswith("apple:") or (
-                not card.get("resource_name") and contact_backend.backend_name() == "apple")):
+        if intent or (
+                (resource_name or "").startswith("apple:") or (
+                not resource_name and contact_backend.backend_name() == "apple")):
             kwargs = {"save_intent": intent, "intent_checkpoint": intent_checkpoint}
             if new_operation:
                 kwargs["new_operation"] = True
-        result: SaveResult = save_contact(draft, card["images"].get("profile"), resource_name=card.get("resource_name"), checkpoint=checkpoint, **kwargs)
+        if not intent and card.get("job_choice") == "update":
+            kwargs.update(job_change=True, target_container=card["job_change"].get("container"))
+        elif not intent and card.get("job_choice") == "new":
+            kwargs.update(force_create=True, save_intent=intent, intent_checkpoint=intent_checkpoint)
+            if new_operation:
+                kwargs["new_operation"] = True
+        result: SaveResult = save_contact(draft, card["images"].get("profile"), resource_name=resource_name, checkpoint=checkpoint, **kwargs)
     except apple_contacts.ConfirmationRequired as exc:
         card.update(status="needs_confirmation", last_error=str(exc), error_kind="unknown_outcome",
                     next_retry_at=None, confirmation_id=secrets.token_hex(8))
@@ -360,6 +573,8 @@ def _save(card: dict, *, new_operation: bool = False) -> dict:
         return {"ok": False, "needs_confirmation": True, "message": str(exc)}
     except ContactSaveError as exc:
         return _save_failed(card, str(exc), getattr(exc, "kind", "other"), getattr(exc, "retryable", False))
+    except cards.StaleCardState:
+        raise  # stale-safe boundary reports refusal without replacing newer state
     except Exception as exc:  # unexpected adapter failure: keep the card, retry later
         log.exception("save failed card=%s", card["id"])
         return _save_failed(card, f"예상치 못한 오류: {str(exc)[:120]}", "other", True)
@@ -372,8 +587,10 @@ def _save(card: dict, *, new_operation: bool = False) -> dict:
     card["error_kind"] = None
     card["next_retry_at"] = None
     card["save_warnings"] = list(result.warnings)
+    cards.schedule_followup(card)
     _persist_save_fields(card, "status", "resource_name", "save_action", "photo_status",
                          "last_error", "error_kind", "next_retry_at", "save_warnings",
+                         "followup_saved_at", "followup_state", "followup_due_at", "followup_nonce",
                          event="saved", detail=result.summary)
     # A crash during cleanup must leave a durable terminal state, never saving.
     keep = {"profile"} if result.photo == "failed" else set()
@@ -384,9 +601,49 @@ def _save(card: dict, *, new_operation: bool = False) -> dict:
     return {"ok": True, "result": result, "message": result.summary, "warnings": list(result.warnings), "photo": result.photo}
 
 
+@stale_safe("outcome")
+def resolve_followup(card_id: str, chat_id, choice: str, nonce: str) -> dict:
+    with card_lock(card_id, blocking=False) as acquired:
+        if not acquired:
+            return {"ok": False, "busy": True, "message": BUSY_MESSAGE}
+        return _resolve_followup_locked(card_id, chat_id, choice, nonce)
+
+
+def _resolve_followup_locked(card_id: str, chat_id, choice: str, nonce: str) -> dict:
+    with cards.followup_lock:
+        card = cards.load_card(card_id)
+        if (not card or card.get("chat_id") != str(chat_id) or card.get("status") != "saved"
+                or card.get("followup_state") not in ("notified", "sending")
+                or not nonce or card.get("followup_nonce") != nonce):
+            return {"ok": False, "stale": True, "message": "이미 처리된 알림입니다."}
+        if choice not in ("sent", "later", "stop", "off"):
+            return {"ok": False, "message": "최근 알림의 버튼을 눌러주세요."}
+        state = cards.initialize_followup()
+        if not state.get("enabled", True) or not cards.followup_days():
+            return {"ok": False, "stale": True, "message": "알림이 꺼져 있습니다."}
+        card["followup_nonce"] = None
+        card["followup_due_at"] = None
+        if choice == "later":
+            card.update(followup_state="pending", followup_due_at=cards.followup_due(time.time(), 3))
+            message = "3일 뒤 다시 알려드리겠습니다."
+        elif choice == "off":
+            state["enabled"] = False
+            cards.save_state("followup", state)
+            card["followup_state"] = "disabled"
+            message = "모든 명함의 후속 알림을 껐습니다."
+        else:
+            card["followup_state"] = "done" if choice == "sent" else "stopped"
+            message = "연락 완료로 기록했습니다." if choice == "sent" else "이 명함의 알림을 그만 보냅니다."
+        cards.save_card(card)
+        return {"ok": True, "message": message}
+
+
+@stale_safe("token")
 def confirmation_token(card: dict) -> str:
     """Migrate old confirmation cards under the same lock used by consumption."""
-    with card_lock(card["id"]):
+    with card_lock(card["id"], blocking=False) as acquired:
+        if not acquired:
+            return ""
         fresh = cards.load_card(card["id"]) or card
         if fresh.get("status") != "needs_confirmation":
             return ""
@@ -397,8 +654,11 @@ def confirmation_token(card: dict) -> str:
         return fresh["confirmation_id"]
 
 
+@stale_safe("outcome")
 def resolve_confirmation(card: dict, choice: str, confirmation_id: str) -> dict:
-    with card_lock(card["id"]):
+    with card_lock(card["id"], blocking=False) as acquired:
+        if not acquired:
+            return {"ok": False, "busy": True, "message": BUSY_MESSAGE}
         fresh = cards.load_card(card["id"])
         if (not fresh or fresh.get("status") != "needs_confirmation" or not confirmation_id
                 or fresh.get("confirmation_id") != confirmation_id):
@@ -417,6 +677,8 @@ def resolve_confirmation(card: dict, choice: str, confirmation_id: str) -> dict:
             return _save(card, new_operation=True)
         card.update(status="saved" if choice == "saved" else "cancelled",
                     photo_status="skipped", last_error=None, error_kind=None)
+        if choice == "saved":
+            cards.schedule_followup(card)
         cards.add_history(card, "confirmed_" + choice)
         cards.save_card(card)
         cleanup_card_images(card)
@@ -441,6 +703,7 @@ def _save_failed(card: dict, message: str, kind: str, retryable: bool) -> dict:
     return {"ok": False, "kind": kind, "retryable": kind != "invalid", "message": message}
 
 
+@stale_safe("scan")
 def retry_due(force: bool = False, on_result: Optional[Callable[[dict, dict], None]] = None) -> tuple[int, list[str]]:
     """Retry approved saves whose backoff elapsed, and photos that failed to upload."""
     saved, failures = 0, []
@@ -451,7 +714,9 @@ def retry_due(force: bool = False, on_result: Optional[Callable[[dict, dict], No
             continue
         if not force and (card.get("next_retry_at") or 0) > time.time():
             continue
-        with card_lock(card["id"]):
+        with card_lock(card["id"], blocking=False) as acquired:
+            if not acquired:
+                continue
             fresh = cards.load_card(card["id"]) or card
             if fresh.get("status") != "save_failed" or fresh.get("approved_revision") != fresh.get("revision"):
                 continue  # saved or edited meanwhile
@@ -466,7 +731,9 @@ def retry_due(force: bool = False, on_result: Optional[Callable[[dict, dict], No
     for card in cards.list_cards(statuses=["saved"]):
         if card.get("photo_status") != "failed" or not card.get("resource_name"):
             continue
-        with card_lock(card["id"]):
+        with card_lock(card["id"], blocking=False) as acquired:
+            if not acquired:
+                continue
             card = cards.load_card(card["id"])
             if not card or card.get("status") != "saved" or card.get("photo_status") != "failed" or not card.get("resource_name"):
                 continue
@@ -497,17 +764,41 @@ def pending_retry_count() -> int:
     return sum(1 for c in cards.list_cards(statuses=["save_failed"]) if c.get("approved_revision") == c.get("revision") and c.get("error_kind") != "invalid")
 
 
-def cancel(card: dict) -> bool:
-    with card_lock(card["id"]):
+@stale_safe("bool")
+def cancel(card: dict, *, blocking: bool = True, defer_processing: bool = False) -> bool:
+    with card_lock(card["id"], blocking=blocking) as acquired:
+        if not acquired:
+            fresh = cards.load_card(card["id"])
+            if fresh and fresh.get("status") == "processing" and not unresolved_save(fresh):
+                request_cancel(card)
+            return False
         if not _refresh_for_change(card, allow_processing=True):
             return False
-        card["status"] = "cancelled"
-        card["awaiting_back"] = False
-        cards.add_history(card, "cancelled")
-        cards.save_card(card)
-        cleanup_card_images(card)
-        cards.save_card(card)
-        return True
+        if defer_processing and card.get("status") == "processing":
+            request_cancel(card)
+            return False
+        return _cancel_locked(card)
+
+
+def finish_cancel_request(card_id: str) -> None:
+    with card_lock(card_id):
+        fresh = cards.load_card(card_id)
+        if fresh and not fresh.get("recognition_id") and cancel_path(card_id).exists():
+            _cancel_locked(fresh)
+
+
+def _cancel_locked(card: dict) -> bool:
+    if card.get("status") not in (*cards.REVIEW_STATUSES, "processing") or unresolved_save(card):
+        return False
+    card.update(status="cancelled", awaiting_back=False)
+    card.pop("recognition_id", None)
+    card.pop("cancel_requested", None)
+    cards.add_history(card, "cancelled")
+    cards.save_card(card)
+    cleanup_card_images(card)
+    cards.save_card(card)
+    cancel_path(card["id"]).unlink(missing_ok=True)
+    return True
 
 
 def archive_saved(card: dict, summary: str) -> None:
@@ -547,11 +838,16 @@ def cleanup_paths(*items) -> None:
 def draft_text(card: dict) -> str:
     draft = current_draft(card)
     header = f"{cards.label(card)} 명함 초안"
-    return draft.to_text(header=header)
+    text = draft.to_text(header=header)
+    old = card.get("job_change")
+    if old:
+        text += f"\n기존 연락처: {old['company']} {old['title']} → 새 명함: {draft.company} {draft.title}"
+    return text
 
 
 # ---------------------------------------------------------------- legacy migration
 
+@stale_safe("notes")
 def migrate_legacy() -> list[str]:
     """Turn old per-chat sessions and pending_contacts files into cards (idempotent).
 

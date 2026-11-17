@@ -1,7 +1,10 @@
 """Shared card-chat wording and selection; Telegram reexports these names."""
 
 from typing import Optional
+from datetime import datetime
+import re
 from . import cards, pipeline
+from .contacts import normalize_phone
 
 
 LIST_WORDS = {"목록", "/list", "list", "대기", "대기목록", "/pending"}
@@ -15,12 +18,13 @@ HELP_TEXT = (
     "- 고치기: 초안 메시지에 답장으로 '항목: 값'을 보내세요. 예) 직함: 과장\n"
     "  (이름, 직함, 직함원문, 회사, 휴대전화, 회사전화, 팩스, 이메일, 웹사이트, 주소, 메모. 비우려면 '팩스: -')\n"
     "- 문장으로 써도 됩니다. 예) 이메일은 kim@acme.com 이야\n"
-    "- '목록': 저장 안 된 명함과 일괄 저장 버튼"
+    "- '목록': 저장 안 된 명함과 일괄 저장 버튼\n"
+    "- /alerts 또는 '알림 설정': 후속 알림 켜기·끄기"
 )
 
 
 def batch_summary(members: list[dict], scope: str, title: str) -> tuple[str, Optional[dict]]:
-    ready = [c for c in members if c["status"] in cards.REVIEW_STATUSES and pipeline.current_draft(c).is_savable]
+    ready = [c for c in members if c["status"] in cards.REVIEW_STATUSES and pipeline.current_draft(c).is_savable and not c.get("job_change")]
     needs_input = [c for c in members if c["status"] in cards.REVIEW_STATUSES and not pipeline.current_draft(c).is_savable]
     saved = [c for c in members if c["status"] == "saved"]
     failed = [c for c in members if c["status"] == "save_failed"]
@@ -29,7 +33,7 @@ def batch_summary(members: list[dict], scope: str, title: str) -> tuple[str, Opt
         draft = pipeline.current_draft(card)
         mark = {"saved": "저장됨", "saving": "저장 중", "save_failed": "저장 보류", "cancelled": "취소", "processing": "처리 중", "needs_confirmation": "저장 확인 필요"}.get(card["status"])
         if card["status"] == "review":
-            mark = "확인 필요" if (draft.warnings or not draft.is_savable) else "준비"
+            mark = "갱신 선택 필요" if card.get("job_change") else ("확인 필요" if (draft.warnings or not draft.is_savable) else "준비")
         lines.append(f"- {cards.label(card)} {draft.display_name or '(이름 없음)'} · {mark}")
     if failed:
         lines.append(f"\n저장 보류 {len(failed)}건은 자동으로 다시 시도합니다.")
@@ -92,3 +96,34 @@ def select_card(chat_id, *, message_id=None, seq=None):
             return card
     open_cards = cards.list_cards(chat_id, cards.REVIEW_STATUSES)
     return open_cards[0] if len(open_cards) == 1 else None
+
+
+def followup_text(card: dict) -> str:
+    draft = pipeline.current_draft(card)
+    try:
+        meeting = cards.followup_localtime(datetime.fromisoformat(card["created_at"]).timestamp()).strftime("%Y-%m-%d")
+    except (KeyError, ValueError):
+        meeting = cards.followup_localtime(card["followup_saved_at"]).strftime("%Y-%m-%d")
+    recipient = " ".join(value.strip() for value in (draft.company, draft.name) if value.strip())
+    heading_name = " ".join(value.strip() for value in (draft.name, draft.company) if value.strip())
+    heading = f"{heading_name} 님께 연락할까요?"
+    if re.search(r"[가-힣ㄱ-ㅎㅏ-ㅣ]", draft.name):
+        greeting = (f"안녕하세요, {recipient}님. {meeting}에 인사드렸습니다. "
+                    "만나 뵙게 되어 반가웠습니다. 앞으로 좋은 인연으로 이어가면 좋겠습니다. 감사합니다.")
+    elif re.search(r"[\u3040-\u30ff\uff66-\uff9f]", draft.name):
+        greeting = (f"{recipient}様、こんにちは。{meeting}はありがとうございました。"
+                    "今後ともよろしくお願いいたします。")
+    elif re.search(r"[\u3400-\u9fff\U00020000-\U0003134f]", draft.name):
+        traditional = any(normalize_phone(number).startswith(("886", "852")) for number in draft.mobile + draft.work)
+        # Unambiguous traditional forms common in names and organization text.
+        traditional = traditional or bool(re.search(r"[陳張劉黃趙吳鄭馮馬羅楊葉謝許鄧蕭賴鍾龔蘇盧蔣賈顧錢孫萬華國臺灣東門廣業貿經會團體製藝學醫龍麗寶聲樂禮偉榮達興愛]", draft.name + draft.company + draft.title))
+        if traditional:
+            greeting = (f"{recipient}，您好！很高興於{meeting}與您見面。"
+                        "期待今後保持聯繫，謝謝！")
+        else:
+            greeting = (f"{recipient}，您好！很高兴于{meeting}与您见面。"
+                        "期待今后保持联系，谢谢！")
+    else:
+        greeting = (f"Hello {draft.name}, it was a pleasure meeting you on {meeting}. "
+                    "I look forward to staying in touch. Best regards.")
+    return heading + "\n\n길게 눌러 아래 인사말을 복사하세요.\n\n" + greeting

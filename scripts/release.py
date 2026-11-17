@@ -160,7 +160,8 @@ def fixture_mobile(value):
     elif digits.startswith("82"):
         digits = "0" + digits[2:].lstrip("0")
     synthetic = ("01012345678", "01011112222", "01099990000")
-    return digits in synthetic or bool(re.fullmatch(r"01055550\d{3}|010(?:0{7})\d", digits))
+    # 010-0000-xxxx is never assigned to subscribers, so tests may use any last four digits.
+    return digits in synthetic or bool(re.fullmatch(r"01055550\d{3}|010(?:0{4})\d{4}", digits))
 
 
 def scan_history(root):

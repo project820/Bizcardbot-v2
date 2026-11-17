@@ -62,7 +62,7 @@ class ReviewRegressionTests(unittest.TestCase):
             with self.subTest(mode=mode):
                 card = self.card(**(dict(name='Synthetic',fax=['020000000']) if mode=='fax' else {}))
                 records, creates = ['before-a','before-b'], []
-                with patch.object(apple,'run_helper',side_effect=self.helper_store(records,creates,'ambiguous' if mode == 'fax' else mode)), patch.object(telegram,'send_message') as send:
+                with patch.object(apple,'run_helper',side_effect=self.helper_store(records,creates,'ambiguous' if mode == 'fax' else mode)), patch.object(telegram,'send_message',return_value={'result': {'message_id': 999}}) as send:
                     pipeline.approve(card)
                     pending = cards.load_card(card['id'])
                     pending['next_retry_at'] = 0
@@ -170,7 +170,7 @@ class ReviewRegressionTests(unittest.TestCase):
                 cards.save_card(card)
                 data=f"{action}:{card['id']}:{pipeline.confirmation_token(card)}"
                 callback={'data':data}
-                with patch.object(telegram,'send_message'), patch.object(pipeline,'save_contact',return_value=contacts.SaveResult('created','apple:synthetic')) as save:
+                with patch.object(telegram,'send_message',return_value={'result': {'message_id': 999}}), patch.object(pipeline,'save_contact',return_value=contacts.SaveResult('created','apple:synthetic')) as save:
                     telegram.handle_callback('token',callback,99)
                     self.assertEqual(cards.load_card(card['id'])['status'],'needs_confirmation')
                     telegram.handle_callback('token',callback,42)
@@ -203,7 +203,7 @@ class ReviewRegressionTests(unittest.TestCase):
         card=self.card()
         card['status']='needs_confirmation'
         cards.save_card(card)
-        with patch.object(telegram,'send_message') as send:
+        with patch.object(telegram,'send_message',return_value={'result': {'message_id': 999}}) as send:
             telegram.send_open_list('token',42)
         labels=[b['text'] for c in send.call_args_list for row in (c.kwargs.get('reply_markup') or {}).get('inline_keyboard',[]) for b in row]
         self.assertIn('이미 저장됨',labels)
@@ -214,7 +214,12 @@ class ReviewRegressionTests(unittest.TestCase):
         with patch.object(apple,'run_helper',side_effect=self.helper_store(records,creates)):
             pipeline.approve(card)
             pending=cards.load_card(card['id'])
-            pipeline.set_draft(pending,CardDraft(name='Changed',mobile=['01000000001']),'test-edit')
+            changed = CardDraft(name='Changed',mobile=['01000000001'])
+            with self.assertRaises(contacts.ContactSaveError):
+                pipeline.set_draft(pending,changed,'test-edit')
+            # Simulate an older persisted revision created before edits were blocked.
+            pending['draft'] = changed.to_dict()
+            pending['revision'] += 1
             pending['approved_revision']=pending['revision']
             cards.save_card(pending)
             pipeline.retry_due(force=True)

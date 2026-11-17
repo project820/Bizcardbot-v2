@@ -23,23 +23,75 @@ def _backend(resource_name=None):
 
 
 def save_contact(draft, profile_image_path, resource_name=None, checkpoint=None,
-                 save_intent=None, intent_checkpoint=None, new_operation=False):
-    if save_intent and save_intent.get("backend") == "apple":
-        backend = apple_contacts
+                 save_intent=None, intent_checkpoint=None, new_operation=False,
+                 force_create=False, job_change=False, target_container=None):
+    if save_intent:
+        backend = apple_contacts if save_intent.get("backend") == "apple" else contacts
     else:
         backend = _backend(resource_name)
     if backend is apple_contacts:
         return backend.save_contact(draft, profile_image_path, resource_name=resource_name,
                                     checkpoint=checkpoint, save_intent=save_intent,
-                                    intent_checkpoint=intent_checkpoint, new_operation=new_operation)
+                                    intent_checkpoint=intent_checkpoint, new_operation=new_operation,
+                                    **({"force_create": True} if force_create else {}),
+                                    **({"job_change": True, "target_container": target_container} if job_change else {}))
+    if job_change or force_create or (save_intent and save_intent.get("op") == "create"):
+        return _save_selected_google(draft, profile_image_path, resource_name, checkpoint,
+                                     save_intent, intent_checkpoint, new_operation, force_create)
     return backend.save_contact(draft, profile_image_path,
                                                resource_name=resource_name, checkpoint=checkpoint)
+
+
+def _save_selected_google(draft, image, resource_name, checkpoint, intent, persist,
+                          new_operation, force_create):
+    """Explicit decisions never run the legacy automatic duplicate matcher."""
+    if intent and intent.get("op") == "create":
+        if not resource_name and not new_operation:
+            raise apple_contacts.ConfirmationRequired()
+        force_create = True
+    if not draft.is_savable:
+        raise ContactSaveError("이름 또는 전화번호가 없어 저장하지 않았습니다.", kind="invalid")
+    if resource_name:
+        try:
+            existing = contacts.get_contact(resource_name)
+            contacts.update_contact(existing, draft)
+        except ContactSaveError as exc:
+            if exc.kind == "not_found":
+                raise apple_contacts.ConfirmationRequired() from exc
+            raise
+        action, saved_name = "updated", resource_name
+    elif force_create:
+        if intent and not new_operation:
+            raise apple_contacts.ConfirmationRequired()
+        if persist is None:
+            raise ContactSaveError("저장 작업 기록을 보존할 수 없습니다.", kind="invalid")
+        persist({"backend": "google", "op": "create", "generation": int((intent or {}).get("generation", 0)) + 1})
+        saved = contacts.create_contact(contacts.build_person(draft))
+        saved_name = saved.get("resourceName") if isinstance(saved, dict) else None
+        if not saved_name:
+            raise apple_contacts.ConfirmationRequired()
+        action = "created"
+    else:
+        raise ContactSaveError("갱신할 연락처를 확인하지 못했습니다.", kind="invalid")
+    result = SaveResult(action, saved_name, display_name=draft.display_name)
+    if checkpoint:
+        try:
+            checkpoint(saved_name, action)
+        except Exception:
+            result.warnings.append("저장 기록 실패: 연락처 앱에서 저장 여부를 확인하세요.")
+    contacts._attach_photo(result, image)
+    result.warnings.extend(contacts.verify_contact(saved_name, draft))
+    return result
 
 
 def upload_photo(resource_name, image_path, save_intent=None):
     if save_intent and save_intent.get("backend") == "apple":
         return apple_contacts.upload_photo(resource_name, image_path, container=save_intent["container"])
     return _backend(resource_name).upload_photo(resource_name, image_path)
+
+
+def find_job_change_candidate(draft):
+    return _backend().find_job_change_candidate(draft)
 
 
 def contact_snapshot():
@@ -70,6 +122,8 @@ def refresh_resource_name(resource_name, draft, save_intent=None):
         except ContactSaveError as exc:
             if exc.kind != "not_found":
                 raise
+        if save_intent.get("replaceOrganization"):
+            raise apple_contacts.ConfirmationRequired()
         matches = apple_contacts.find_fingerprint(save_intent["fingerprint"], save_intent["container"])
         if len(matches) == 1:
             return "apple:" + next(iter(matches))

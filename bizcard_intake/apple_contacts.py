@@ -53,14 +53,14 @@ def ensure_helper() -> Path:
             raise ContactSaveError("Mac 연락처 도우미를 준비하지 못했습니다. xcode-select --install로 빌드 도구를 확인하세요.") from exc
 
 
-def run_helper(command: str, **payload) -> dict:
+def run_helper(command: str, *, _timeout=None, **payload) -> dict:
     binary = ensure_helper()
     uncertain = command in ("create", "update")
     try:
         # subprocess.run kills AND waits for the child on timeout before raising.
         # Recovery scans must never overlap a still-running mutation helper.
         completed = subprocess.run([str(binary)], input=json.dumps({"command": command, **payload}, ensure_ascii=False),
-                                   capture_output=True, text=True, check=False, timeout=HELPER_TIMEOUT)
+                                   capture_output=True, text=True, check=False, timeout=HELPER_TIMEOUT if _timeout is None else _timeout)
     except subprocess.TimeoutExpired as exc:
         if uncertain:
             raise ContactSaveError(UNKNOWN_MESSAGE, kind="unknown_outcome") from exc
@@ -191,6 +191,37 @@ def reconcile_intent(intent: dict) -> str:
     raise ConfirmationRequired()
 
 
+def find_job_change_candidate(draft: CardDraft) -> dict | None:
+    if not draft.name.strip() or not (draft.mobile or draft.email):
+        return None
+    selected = container_id() or run_helper("containers", _timeout=3).get("defaultIdentifier", "")
+    if not selected:
+        return None
+    result = run_helper("find-job-change", _timeout=3, container=selected, name=draft.name,
+                        displayName=draft.display_name,
+                        phones=sorted({contacts.normalize_phone(v) for v in draft.mobile} - {""}),
+                        emails=sorted({v.strip().lower() for v in draft.email} - {""}))
+    identifiers = list(dict.fromkeys(result.get("identifiers", [])))
+    if len(identifiers) != 1:
+        return None
+    person = contacts.select_job_change_candidate(draft, [_person(run_helper("get", _timeout=3, identifier=identifiers[0], container=selected))])
+    if person:
+        person["_container"] = selected
+    return person
+
+
+def build_job_change_update(existing: dict, draft: CardDraft) -> dict:
+    person = build_update(existing, draft)
+    person["names"] = build_person(draft)["names"]
+    organization = dict((existing.get("organizations") or [{}])[0])
+    if draft.company.strip():
+        organization["name"] = draft.company
+    if draft.title.strip():
+        organization["title"] = draft.title
+    person["organizations"] = [organization]
+    return person
+
+
 def find_existing_candidates(draft: CardDraft, container: str | None = None) -> tuple[dict | None, int]:
     phones = sorted({contacts.normalize_phone(value) for value in (draft.mobile or draft.work)} - {""})
     if not phones or not draft.name.strip():
@@ -245,7 +276,7 @@ def _attach_photo(result: SaveResult, image_path: str | None, draft=None, checkp
         try:
             upload_photo(result.resource_name, image_path, container=operation["container"]) if operation else upload_photo(result.resource_name, image_path)
         except ContactSaveError as exc:
-            if exc.kind != "not_found" or draft is None:
+            if exc.kind != "not_found" or draft is None or (operation and operation.get("replaceOrganization")):
                 raise
             # CardDAV can replace a newly created local identifier during its first sync.
             if operation:
@@ -264,6 +295,8 @@ def _attach_photo(result: SaveResult, image_path: str | None, draft=None, checkp
                     result.warnings.append("연락처 식별자 변경 기록에 실패했습니다.")
             upload_photo(result.resource_name, image_path, container=operation["container"]) if operation else upload_photo(result.resource_name, image_path)
     except ContactSaveError as exc:
+        if exc.kind == "not_found" and operation and operation.get("replaceOrganization"):
+            raise ConfirmationRequired() from exc
         result.photo = "failed"
         result.warnings.append(f"사진 업로드 실패: {exc}")
         return
@@ -275,26 +308,29 @@ def _pinned_get(identifier: str, container: str) -> dict:
 
 
 def _update_target(intent: dict) -> dict:
-    """A vanished update target can be rebound, but never turned into a create."""
+    """Job changes stay pinned; only legacy updates allow CardDAV rebinding."""
     try:
         return _pinned_get(intent["target_identifier"], intent["container"])
     except ContactSaveError as exc:
         if exc.kind != "not_found":
             raise
+    if intent.get("replaceOrganization"):
+        raise ConfirmationRequired()
     matches = find_fingerprint(intent["fingerprint"], intent["container"])
     if len(matches) != 1:
         raise ConfirmationRequired()
     return _pinned_get(next(iter(matches)), intent["container"])
 
 
-def _save_operation(draft, resource_name, intent, persist, new_operation=False):
+def _save_operation(draft, resource_name, intent, persist, new_operation=False, force_create=False,
+                    job_change=False, target_container=None):
     """The persisted record is a write-ahead boundary, not a retry permission.
 
     A process dying immediately after persist is indistinguishable from a lost
     response. Create recovery is therefore always read-only. Only a consumed
     confirmation may replace the original record and enter the write branch.
     """
-    selected = intent["container"] if intent else container_id()
+    selected = intent["container"] if intent else (target_container if job_change else container_id())
     if not selected:
         selected = run_helper("containers").get("defaultIdentifier", "")
         if not selected:
@@ -308,6 +344,8 @@ def _save_operation(draft, resource_name, intent, persist, new_operation=False):
             # Pre-release intents did not distinguish updates from creates.
             raise ConfirmationRequired()
         if resource_name:
+            if intent.get("replaceOrganization"):
+                _update_target(intent)
             # A successful write was already checkpointed before a process exit.
             return resource_name, "created" if op == "create" else "updated", warnings, intent
         if op == "create":
@@ -319,6 +357,8 @@ def _save_operation(draft, resource_name, intent, persist, new_operation=False):
             target = intent.get("target_identifier") or (_identifier(resource_name) if resource_name else None)
         elif resource_name:
             op, target = "update", _identifier(resource_name)
+        elif force_create:
+            op, target = "create", None
         else:
             existing, count = find_existing_candidates(draft, selected)
             op = "update" if existing else "create"
@@ -328,8 +368,10 @@ def _save_operation(draft, resource_name, intent, persist, new_operation=False):
         value = fingerprint(draft)
         next_intent = {"op": op, "backend": "apple", "container": selected,
                        "target_identifier": target, "fingerprint": value,
-                       "identifiers": sorted(find_fingerprint(value, selected)),
+                       "identifiers": [] if job_change or (intent or {}).get("replaceOrganization") else sorted(find_fingerprint(value, selected)),
                        "generation": int((intent or {}).get("generation", 0)) + 1}
+        if job_change or (intent or {}).get("replaceOrganization"):
+            next_intent["replaceOrganization"] = True
         if persist is None:
             raise ContactSaveError("저장 작업 기록을 보존할 수 없습니다.", kind="invalid")
         persist(next_intent)  # fsync + atomic replace, before every external mutation.
@@ -340,21 +382,33 @@ def _save_operation(draft, resource_name, intent, persist, new_operation=False):
                 raise ContactSaveError(UNKNOWN_MESSAGE, kind="unknown_outcome")
             return saved["resourceName"], "created", warnings, intent
         existing = _update_target(intent)
-    saved = _person(run_helper("update", container=selected,
-                    identifier=_identifier(existing["resourceName"]),
-                    person=build_update(existing, draft), unionOnly=True))
+    try:
+        saved = _person(run_helper("update", container=selected,
+                        identifier=_identifier(existing["resourceName"]),
+                        person=build_job_change_update(existing, draft) if intent.get("replaceOrganization") else build_update(existing, draft),
+                        unionOnly=True, **({"replaceOrganization": True} if intent.get("replaceOrganization") else {})))
+    except ContactSaveError as exc:
+        if exc.kind == "not_found" and intent.get("replaceOrganization"):
+            raise ConfirmationRequired() from exc
+        raise
     if not saved.get("resourceName"):
         raise ContactSaveError(UNKNOWN_MESSAGE, kind="unknown_outcome")
     return saved["resourceName"], "updated", warnings, intent
 
 
 def save_contact(draft: CardDraft, profile_image_path: str | None, resource_name: str | None = None,
-                 checkpoint=None, save_intent=None, intent_checkpoint=None, new_operation=False) -> SaveResult:
+                 checkpoint=None, save_intent=None, intent_checkpoint=None, new_operation=False,
+                 force_create=False, job_change=False, target_container=None) -> SaveResult:
     if not draft.is_savable:
         raise ContactSaveError("이름 또는 전화번호가 없어 저장하지 않았습니다.", kind="invalid")
+    if job_change and not (resource_name or (save_intent or {}).get("target_identifier")):
+        raise ConfirmationRequired()
+    if (force_create or job_change) and not (intent_checkpoint or save_intent):
+        raise ContactSaveError("저장 작업 기록을 보존할 수 없습니다.", kind="invalid")
     if intent_checkpoint or save_intent:
         saved_name, action, warnings, operation = _save_operation(
-            draft, resource_name, save_intent, intent_checkpoint, new_operation)
+            draft, resource_name, save_intent, intent_checkpoint, new_operation, force_create,
+            job_change, target_container)
     else:
         # Standalone adapter callers have no per-card state. The bot always uses
         # the write-ahead path above; keep the public low-level adapter usable.

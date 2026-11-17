@@ -54,6 +54,18 @@ FIELD_GUIDE = (
 )
 
 
+CJK_FIELD_GUIDE = (
+    "일본어·중국어 이름은 성 먼저, 원문 문자 그대로 보존해라. "
+    "후리가나·로마자·병음 독음은 이름 대신 쓰거나 새로 만들지 말고, 명함에 있으면 notes에 적어라. "
+    "display_title도 원문 짧은 직함(部長, 经理, 經理)을 쓰고, 주소와 회사명도 번역하지 마라. "
+    "株式会社·有限会社·有限公司·股份有限公司 등 회사명 표기를 그대로 유지해라. "
+    "일본 +81, 중국 +86, 홍콩 +852, 대만 +886 번호를 보존해라. "
+    "주소·언어로 국가가 확실하면 현지 번호를 +81/+86/+852/+886 국제 형식으로 출력해라. "
+    "+81·+86·+886 뒤에는 국내 접두 0을 빼고, +852는 0을 임의로 붙이지 마라. "
+    "070/080처럼 국가가 겹쳐 모호한 번호는 인쇄된 그대로 유지해라. 국가가 불명확하면 현지 번호를 그대로 두고 warnings에 국가 확인 필요를 적어라.\n"
+)
+
+
 def backend_name() -> str:
     choice = os.environ.get("BIZCARD_PARSER", "auto").strip().lower()
     if choice in ("openai", "codex", "claude"):
@@ -118,10 +130,14 @@ def find_binary(name: str) -> Optional[str]:
 def card_prompt(ocr: OcrResult, side: str) -> str:
     side_label = "앞면" if side == "front" else "뒷면"
     raw_ocr = ocr.text[:5000] if ocr.text else "(OCR 원문 없음)"
+    # Keep the v2.1.1 prompt untouched for Korean, mixed Korean/CJK and English.
+    has_hangul = bool(re.search(r"[\u1100-\u11ff\u3130-\u318f\ua960-\ua97f\uac00-\ud7ff]", ocr.text))
+    has_cjk = bool(re.search(r"[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\uff66-\uff9f\U00020000-\U000323af]", ocr.text))
+    guide = FIELD_GUIDE + ("\n" + CJK_FIELD_GUIDE if has_cjk and not has_hangul else "")
     return (
         f"명함 {side_label}의 보정 이미지와 Apple Vision OCR 원문을 대조해 Google Contacts 입력 필드를 채워라. "
         "이름과 휴대전화가 가장 중요하고 회사명과 이메일은 보조 필드다.\n\n"
-        f"{FIELD_GUIDE}\n\n"
+        f"{guide}\n\n"
         f"[OCR 평균 confidence: {ocr.average_confidence:.3f}]\n[OCR 원문]\n{raw_ocr}"
     )
 

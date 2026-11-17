@@ -67,7 +67,7 @@ class OrientationTest(unittest.TestCase):
                     os.utime(binary, (source.stat().st_mtime + 1, source.stat().st_mtime + 1))
                     run.reset_mock()
                     self.assertEqual(getattr(module, ensure_name)(), binary)
-                    run.assert_not_called()
+                    self.assertEqual(run.call_count, 0)
 
 
 class OrientationEvaluationTest(unittest.TestCase):

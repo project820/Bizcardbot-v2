@@ -44,11 +44,23 @@ func replace(_ text: String, _ pattern: String, _ value: String = "") -> String 
 }
 
 func normalizedPhone(_ text: String) -> String {
-    let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    var trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+    let folded = trimmed.precomposedStringWithCompatibilityMapping
+    if folded.range(of: #"^(?:\+|00)(?:81|86|852|886)\D*\d"#, options: .regularExpression) != nil {
+        trimmed = folded
+    }
     let clean = replace(trimmed, #"\(\s*0\s*\)"#)
     var digits = replace(clean, #"\D+"#)
     var international = trimmed.hasPrefix("+")
     if digits.hasPrefix("00") { digits = String(digits.dropFirst(2)); international = true }
+    if international {
+        for country in ["81", "86", "886"] {
+            if digits.hasPrefix(country + "0") {
+                digits = country + String(digits.dropFirst(country.count + 1))
+                break
+            }
+        }
+    }
     if digits.hasPrefix("82") && (international || digits.count >= 11) {
         digits = String(digits.dropFirst(2))
         if !digits.hasPrefix("0") { digits = "0" + digits }
@@ -144,7 +156,16 @@ func array(_ input: [String: Any], _ key: String) -> [[String: String]] {
     input[key] as? [[String: String]] ?? []
 }
 
-func apply(_ person: [String: Any], to contact: CNMutableContact) {
+func apply(_ person: [String: Any], to contact: CNMutableContact, replaceOrganization: Bool = false) {
+    if replaceOrganization {
+        let name = array(person, "names").first ?? [:]
+        let organization = array(person, "organizations").first ?? [:]
+        contact.givenName = name["givenName"] ?? ""
+        contact.familyName = name["familyName"] ?? ""
+        if let value = organization["name"], !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { contact.organizationName = value }
+        if let value = organization["title"], !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { contact.jobTitle = value }
+        if let value = organization["department"], !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { contact.departmentName = value }
+    }
     if contact.givenName.isEmpty && contact.familyName.isEmpty,
        let name = array(person, "names").first?["givenName"] {
         contact.givenName = name
@@ -222,7 +243,7 @@ func execute(_ input: [String: Any]) throws -> [String: Any] {
         return ["containers": try store.containers(matching: nil).map {
             ["id": $0.identifier, "name": $0.name, "type": $0.type.rawValue] as [String: Any]
         }, "defaultIdentifier": store.defaultContainerIdentifier()]
-    case "find", "find-fingerprint":
+    case "find", "find-fingerprint", "find-job-change":
         let container = try selectedContainer(store, input)
         let request = CNContactFetchRequest(keysToFetch: findKeys)
         request.predicate = CNContact.predicateForContactsInContainer(withIdentifier: container)
@@ -243,7 +264,7 @@ func execute(_ input: [String: Any]) throws -> [String: Any] {
             let addresses = Set(contact.emailAddresses.map { ($0.value as String).trimmingCharacters(in: .whitespacesAndNewlines).lowercased() })
             let matchesKey = command == "find-fingerprint"
                 ? ((!phones.isEmpty || !emails.isEmpty) && phones.isSubset(of: numbers) && emails.isSubset(of: addresses))
-                : !phones.isDisjoint(with: numbers)
+                : (!phones.isDisjoint(with: numbers) || (command == "find-job-change" && !emails.isDisjoint(with: addresses)))
             if matchesName && matchesKey { identifiers.insert(contact.identifier) }
         }
         return ["identifiers": identifiers.sorted(), "count": identifiers.count]
@@ -261,7 +282,7 @@ func execute(_ input: [String: Any]) throws -> [String: Any] {
             request.add(contact, toContainerWithIdentifier: container)
         } else {
             contact = try fetchPinned(store, input)
-            apply(person, to: contact)
+            apply(person, to: contact, replaceOrganization: input["replaceOrganization"] as? Bool ?? false)
             request.update(contact)
         }
         try store.execute(request)

@@ -23,6 +23,7 @@ import os
 import re
 import subprocess
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -272,6 +273,33 @@ def _dedupe_key(key: str, item: dict) -> str:
 # ------------------------------------------------------------------- matching
 
 
+def select_job_change_candidate(draft: CardDraft, people) -> Optional[dict[str, Any]]:
+    """Strict identity first; ambiguous people never become an update suggestion."""
+    phones = {normalize_phone(v) for v in draft.mobile} - {""}
+    emails = {v.strip().lower() for v in draft.email} - {""}
+    matches = {}
+    for person in people:
+        numbers = {normalize_phone(p.get("value", "")) for p in person.get("phoneNumbers", [])}
+        addresses = {p.get("value", "").strip().lower() for p in person.get("emailAddresses", [])}
+        if (phones & numbers or emails & addresses) and has_matching_name(person, draft) and person.get("resourceName"):
+            matches[person["resourceName"]] = person
+    if len(matches) != 1:
+        return None
+    person = next(iter(matches.values()))
+    organization = (person.get("organizations") or [{}])[0]
+    old_org = (organization.get("name", "").strip(), organization.get("title", "").strip())
+    new_org = (draft.company.strip(), draft.title.strip())
+    if not any(old_org) or not any(new_org) or old_org == new_org:
+        return None
+    return person
+
+
+def find_job_change_candidate(draft: CardDraft) -> Optional[dict[str, Any]]:
+    if not draft.name.strip() or not (draft.mobile or draft.email):
+        return None
+    return select_job_change_candidate(draft, iter_connections(SCAN_FIELDS, timeout=3))
+
+
 def find_existing_contact(draft: CardDraft) -> Optional[dict[str, Any]]:
     """The single existing contact for this card (person dict), or None when
     there is no match or the match is ambiguous."""
@@ -328,21 +356,28 @@ def _remember_created(resource_name: str, person: dict[str, Any]) -> None:
         people.append({"resourceName": resource_name, "names": person.get("names", []), "phoneNumbers": person.get("phoneNumbers", [])})
 
 
-def iter_connections(person_fields: str):
+def iter_connections(person_fields: str, *, timeout=None):
     people = getattr(_snapshot, "people", None)
     if people is not None and person_fields == SCAN_FIELDS:
         yield from list(people)
         return
-    yield from _scan_connections(person_fields)
+    yield from _scan_connections(person_fields, timeout=timeout)
 
 
-def _scan_connections(person_fields: str):
+def _scan_connections(person_fields: str, *, timeout=None):
+    deadline = time.monotonic() + timeout if timeout is not None else None
     page_token = None
     while True:
         params: dict[str, Any] = {"resourceName": "people/me", "personFields": person_fields, "pageSize": 1000}
         if page_token:
             params["pageToken"] = page_token
-        data = run_gws(["people", "people", "connections", "list", "--params", json.dumps(params, ensure_ascii=False)])
+        kwargs = {}
+        if deadline is not None:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise ContactSaveError("연락처 후보 조회 시간이 초과되었습니다.", kind="transient")
+            kwargs["timeout"] = remaining
+        data = run_gws(["people", "people", "connections", "list", "--params", json.dumps(params, ensure_ascii=False)], **kwargs)
         yield from data.get("connections", [])
         page_token = data.get("nextPageToken")
         if not page_token:
@@ -381,12 +416,22 @@ def draft_phones(draft: CardDraft) -> list[str]:
 
 def normalize_phone(value: str) -> str:
     """'+82 (0)10-1234-5678', '0082 10 1234 5678', '82-10-...' -> '01012345678'."""
+    import unicodedata
+
     value = (value or "").strip()
+    folded = unicodedata.normalize("NFKC", value)
+    if re.match(r"^(?:\+|00)(?:81|86|852|886)\D*\d", folded):
+        value = folded
     value = re.sub(r"\(\s*0\s*\)", "", value)
     international = value.startswith("+")
     digits = re.sub(r"\D+", "", value)
     if digits.startswith("00"):
         digits, international = digits[2:], True
+    if international:
+        for country in ("81", "86", "886"):
+            if digits.startswith(country + "0"):
+                digits = country + digits[len(country) + 1:]
+                break
     if digits.startswith("82") and (international or len(digits) >= 11):
         digits = digits[2:]
         if not digits.startswith("0"):
@@ -405,8 +450,19 @@ def international_phone(value: str) -> str:
     national form a later card edit re-indexes nothing and name search keeps
     missing the thread. Foreign (+...) and 15xx-style numbers stay as they are.
     """
+    import unicodedata
+
     text = (value or "").strip()
+    folded = unicodedata.normalize("NFKC", text)
+    if re.match(r"^(?:\+|00)(?:81|86|852|886)\D*\d", folded):
+        text = folded
+    if re.match(r"^00(?:81|86|852|886)\D*\d", text):
+        text = "+" + text[2:]
     if not text or text.startswith("+"):
+        return text
+    # A local number carries no country context. Do not turn identifiable
+    # Japanese formats into invalid Korean +82 3 / +82 6 / +82 90 numbers.
+    if re.match(r"^\(?0[346][)\-.\s]", text) or re.match(r"^090", text):
         return text
     grouped = _KOREAN_GROUPED.match(text)
     if grouped:
@@ -450,9 +506,9 @@ def update_contact(existing: dict[str, Any], draft: CardDraft) -> dict[str, Any]
     )
 
 
-def run_gws(args: list[str], allow_failure: bool = False, expect_json: bool = True, mutating: bool = False) -> dict[str, Any]:
+def run_gws(args: list[str], allow_failure: bool = False, expect_json: bool = True, mutating: bool = False, *, timeout=None) -> dict[str, Any]:
     try:
-        completed = subprocess.run(["gws", *args], check=False, capture_output=True, text=True, timeout=GWS_TIMEOUT,
+        completed = subprocess.run(["gws", *args], check=False, capture_output=True, text=True, timeout=GWS_TIMEOUT if timeout is None else timeout,
                                    env={**os.environ, "GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND": "file"})
     except FileNotFoundError:
         raise ContactSaveError("gws CLI를 찾을 수 없습니다. brew install googleworkspace-cli", kind="other")

@@ -17,6 +17,7 @@ class CardTestCase(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.tmp = Path(self._tmp.name)
         self.patches = [
+            patch.object(pipeline.contact_backend, "find_job_change_candidate", return_value=None),
             patch.object(cards, "CARD_DIR", self.tmp / "cards"),
             patch.object(pipeline, "SESSION_DIR", self.tmp / "sessions"),
             patch.object(pipeline, "SESSION_ARCHIVE_DIR", self.tmp / "archive"),
@@ -50,6 +51,12 @@ def ok_save(draft, image, resource_name=None, checkpoint=None):
 
 
 class PipelineTest(CardTestCase):
+    def test_optional_lookup_fixture_never_spawns_subprocess(self):
+        card = self.review_card()
+        with patch('subprocess.run', side_effect=AssertionError('lookup leaked subprocess')) as spawn:
+            pipeline.refresh_job_change(card)
+            self.assertEqual(spawn.call_count, 0)
+
     def test_retry_save_serializes_edit_and_cancel_without_false_success(self):
         for operation in ('edit', 'cancel'):
             with self.subTest(operation=operation):

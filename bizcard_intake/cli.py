@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import apple_contacts, cards, doctor, migrate_names, onboarding, pipeline, telegram
+from . import apple_contacts, cards, doctor, migrate_names, onboarding, pipeline, telegram, writer
 from .contacts import ContactSaveError
 from .contacts import LOGIN_COMMAND
 from .envfile import read_settings
@@ -65,11 +65,7 @@ def main(argv: list[str] | None = None) -> int:
         if not token:
             raise SystemExit("TELEGRAM_BOT_TOKEN is required")
         telegram.setup_logging()
-        warm_up = getattr(pipeline, "warm_up", None)
-        if warm_up:
-            warm_up()
-        telegram.main()
-        return 0
+        return cmd_bot()
     if command == "scan":
         return cmd_scan(args.image)
     if command == "save":
@@ -95,6 +91,15 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
+@writer.required(bot_start=True)
+def cmd_bot() -> int:
+    warm_up = getattr(pipeline, "warm_up", None)
+    if warm_up:
+        warm_up()
+    return telegram.main() or 0
+
+
+@writer.required
 def cmd_scan(image: Path) -> int:
     if not image.exists():
         print(f"파일 없음: {image}", file=sys.stderr)
@@ -103,13 +108,18 @@ def cmd_scan(image: Path) -> int:
     target = pipeline.DATA_DIR / "cli" / "front" / f"{card['id']}_{image.name}"
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(image, target)
-    pipeline.recognize_front(card, target)
+    try:
+        pipeline.recognize_front(card, target)
+    except (pipeline.ContactSaveError, cards.StaleCardState) as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
     print(pipeline.draft_text(card))
     print(f"\n[rectifier={card.get('rectifier')}] 명함 ID: {card['id']}")
     print(f"저장하려면: python -m bizcard_intake save {card['id']}")
     return 0
 
 
+@writer.required
 def cmd_save(target: Path) -> int:
     card = cards.load_card(str(target))
     if card is None and target.exists():
@@ -117,7 +127,11 @@ def cmd_save(target: Path) -> int:
         card = cards.load_card(legacy.get("id", "")) if legacy.get("id") else None
         if card is None:
             card = pipeline._card_from_legacy("cli", legacy, "review")
-            cards.save_card(card)
+            try:
+                cards.save_card(card)
+            except cards.StaleCardState:
+                print("저장 상태가 변경되었습니다. 명함 ID로 다시 확인하세요.", file=sys.stderr)
+                return 1
     if card is None:
         print(f"명함 ID 또는 세션 파일을 찾을 수 없음: {target}", file=sys.stderr)
         return 1
@@ -128,6 +142,7 @@ def cmd_save(target: Path) -> int:
     return 0 if outcome["ok"] else 1
 
 
+@writer.required
 def cmd_retry_pending() -> int:
     pipeline.migrate_legacy()
     saved, failures = pipeline.retry_due(force=True)
@@ -138,7 +153,6 @@ def cmd_retry_pending() -> int:
 
 
 def cmd_list() -> int:
-    pipeline.migrate_legacy()
     open_cards = cards.list_cards(statuses=cards.OPEN_STATUSES)
     if not open_cards:
         print("저장 안 된 명함 없음")
@@ -148,6 +162,7 @@ def cmd_list() -> int:
     return 0
 
 
+@writer.required
 def cmd_migrate_names(apply: bool, only, limit) -> int:
     plan = migrate_names.plan_migration()
     if only:
@@ -163,6 +178,7 @@ def cmd_migrate_names(apply: bool, only, limit) -> int:
     return 0
 
 
+@writer.required
 def cmd_rollback_names(backup: Path) -> int:
     results = migrate_names.rollback(backup)
     print(json.dumps(results, ensure_ascii=False, indent=2))

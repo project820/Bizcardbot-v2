@@ -202,7 +202,11 @@ class CardDraft:
 
 def short_title_of(title: str) -> str:
     """'영업팀장/컨설턴트 (Sales Executive)' -> '영업팀장'."""
-    for part in TITLE_SPLIT.split(title or ""):
+    title = title or ""
+    # Split full-width slashes only in CJK titles without Hangul.
+    if re.search(r"[\u3040-\u30ff\u3400-\u9fff]", title) and not re.search(r"[\u1100-\u11ff\u3130-\u318f\ua960-\ua97f\uac00-\ud7ff]", title):
+        title = title.replace("／", "/")
+    for part in TITLE_SPLIT.split(title):
         part = part.strip(" )）]")
         if part:
             return part

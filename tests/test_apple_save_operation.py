@@ -152,7 +152,7 @@ class SaveOperationTests(unittest.TestCase):
                 with patch.dict(os.environ, {'BIZCARD_CONTACTS_BACKEND': 'google', 'BIZCARD_APPLE_CONTAINER': 'other'}):
                     with ThreadPoolExecutor(max_workers=8) as pool:
                         outcomes = list(pool.map(lambda _: pipeline.resolve_confirmation(copy.deepcopy(card), 'again', nonce), range(8)))
-                    self.assertEqual(sum(not o.get('stale') for o in outcomes), 1)
+                    self.assertEqual(sum(not (o.get('stale') or o.get('busy')) for o in outcomes), 1)
                     pipeline.retry_due(force=True)
                     fresh = cards.load_card(card['id'])
                     self.assertEqual(fresh['status'], 'needs_confirmation')
@@ -168,7 +168,7 @@ class SaveOperationTests(unittest.TestCase):
                     with patch.object(telegram, 'api_post') as api, patch.object(telegram, 'send_message'):
                         telegram.handle_callback('token', callback, 42)
                     answers = [c.args[2] for c in api.call_args_list if c.args[1] == 'answerCallbackQuery']
-                    self.assertIn({'callback_query_id': 'synthetic', 'text': '이미 처리됨'}, answers)
+                    self.assertEqual(answers, [{'callback_query_id': 'synthetic'}])
                     edits = [c.args[2] for c in api.call_args_list if c.args[1] == 'editMessageReplyMarkup']
                     self.assertTrue(any(p['message_id'] == 77 and p['reply_markup'] == {'inline_keyboard': []} for p in edits))
             fresh['status'] = 'cancelled'
@@ -440,7 +440,7 @@ class SaveOperationTests(unittest.TestCase):
                         telegram, 'send_message', return_value={'result': {'message_id': 777}}) as send, patch.object(telegram, 'submit') as submit:
                         outcome = pipeline.approve(card)
                     self.assertTrue(outcome['ok'], outcome)
-                    self.assertIn('저장 중입니다', send.call_args.args[2])
+                    self.assertIn('처리 중입니다', send.call_args.args[2])
                     submit.assert_not_called()
                     final = cards.load_card(card['id'])
                     self.assertEqual(final['status'], 'saved')
@@ -557,7 +557,7 @@ class SaveOperationTests(unittest.TestCase):
             if command == 'set-photo':
                 raise contacts.ContactSaveError('synthetic photo failure', kind='transient')
             raise AssertionError(command)
-        with patch.object(apple, 'run_helper', side_effect=helper), patch.object(telegram, 'send_message') as send:
+        with patch.object(apple, 'run_helper', side_effect=helper), patch.object(telegram, 'send_message', return_value={'result': {'message_id': 999}}) as send:
             telegram.confirm_card('synthetic', 42, card, 'again', 'nonce')
         text = send.call_args.args[2]
         self.assertIn('연락처 사진은 올리지 못해', text)
@@ -570,9 +570,10 @@ class SaveOperationTests(unittest.TestCase):
         card = self.card()
         for status in ('saving', 'needs_confirmation', 'review'):
             with self.subTest(status=status), patch.dict(os.environ, {}, clear=True):
+                card = cards.load_card(card['id'])
                 card.update(status=status)
                 cards.save_card(card)
-                with patch.object(telegram, 'send_message') as send:
+                with patch.object(telegram, 'send_message', return_value={'result': {'message_id': 999}}) as send:
                     telegram.send_open_list('synthetic', 42)
                 text = send.call_args_list[0].args[2]
                 self.assertNotIn('None', text)
@@ -596,7 +597,7 @@ class SaveOperationTests(unittest.TestCase):
                     self.assertEqual(cards.load_card(card['id']), before)
                     submit.assert_not_called()
 
-    def test_photo_retry_serializes_message_updates(self):
+    def test_photo_retry_records_message_after_lock_release(self):
         import threading
         card = self.card()
         photo = Path(self.tmp.name) / 'retry.jpg'
@@ -608,8 +609,11 @@ class SaveOperationTests(unittest.TestCase):
         cards.save_card(card)
         started, done = threading.Event(), threading.Event()
         workers = []
+        real_lock = pipeline.card_lock
+        def observed_lock(cid, **kwargs):
+            if kwargs.get('blocking', True): started.set()
+            return real_lock(cid, **kwargs)
         def update_message():
-            started.set()
             telegram._remember_card_message(copy.deepcopy(card), 999)
             done.set()
         def upload(*args, **kwargs):
@@ -617,14 +621,17 @@ class SaveOperationTests(unittest.TestCase):
             workers.append(worker)
             worker.start()
             self.assertTrue(started.wait(2))
-            self.assertFalse(done.wait(.05), 'UI writer bypassed the photo retry lock')
+            self.assertFalse(done.is_set(), 'message recording must wait for the held card lock')
+            self.assertEqual(cards.find_by_message(42, 999)['id'], card['id'])
         try:
-            with patch.object(pipeline, 'refresh_resource_name', return_value='apple:written'), patch.object(pipeline, 'upload_photo', side_effect=upload):
+            with patch.object(pipeline, 'card_lock', side_effect=observed_lock), patch.object(pipeline, 'refresh_resource_name', return_value='apple:written'), patch.object(pipeline, 'upload_photo', side_effect=upload):
                 pipeline.retry_due(force=True)
         finally:
             for worker in workers:
-                worker.join(2)
+                worker.join(5)
+                self.assertFalse(worker.is_alive(), 'record did not finish after photo retry')
         self.assertTrue(done.is_set())
         final = cards.load_card(card['id'])
         self.assertEqual(final['photo_status'], 'uploaded')
         self.assertEqual(final['message_ids'], [999])
+        self.assertEqual(cards.find_by_message(42, 999)['id'], card['id'])

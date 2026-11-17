@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+from . import writer
+
 import json
+import secrets
 import logging
 import logging.handlers
 import os
@@ -18,7 +21,7 @@ from urllib.request import Request, urlopen
 
 from . import cards, contact_backend as contacts, doctor, pipeline
 from . import apple_contacts
-from .chat_ux import HELP_TEXT, HELP_WORDS, LIST_WORDS, batch_summary, edit_prompt, save_result_text, select_card
+from .chat_ux import HELP_TEXT, HELP_WORDS, LIST_WORDS, batch_summary, edit_prompt, save_result_text, select_card, followup_text
 from .pipeline import DATA_DIR, LOG_DIR
 
 API_BASE = "https://api.telegram.org"
@@ -185,9 +188,22 @@ def _alert_token_conflict(token: str, bot_id: int) -> None:
             log.error("could not persist or send Telegram token-use alert to chat=%s", chat_id)
 
 
+@writer.required(bot_start=True)
 def run(token: str, data_dir: Path = DATA_DIR) -> None:
+    try:
+        _run(token, data_dir)
+    finally:
+        # Do not release the process writer while contact workers still run.
+        global _executor
+        if _executor is not None:
+            _executor.shutdown(wait=True)
+            _executor = None
+
+
+def _run(token: str, data_dir: Path = DATA_DIR) -> None:
     if not allowed_chat_ids():
         raise SystemExit("TELEGRAM_ALLOWED_CHAT_IDS is required (comma-separated chat ids allowed to use the bot)")
+    cards.initialize_followup()
     try:
         initialize_contacts(token)
     except Exception:
@@ -216,10 +232,12 @@ def run(token: str, data_dir: Path = DATA_DIR) -> None:
     while True:
         if time.monotonic() >= next_health_check:
             health_check(token)
+            _safe_send_due_followups(token)
             next_health_check = time.monotonic() + HEALTH_CHECK_INTERVAL
             next_retry_scan = time.monotonic() + RETRY_SCAN_INTERVAL
         elif time.monotonic() >= next_retry_scan:
             retry_due_and_report(token)
+            _safe_send_due_followups(token)
             next_retry_scan = time.monotonic() + RETRY_SCAN_INTERVAL
         try:
             updates = get_updates(token, offset)
@@ -264,21 +282,38 @@ def handle_updates(token: str, updates: list, data_dir: Path = DATA_DIR, offset:
     return offset
 
 
+@pipeline.stale_safe("none")
 def recover_interrupted() -> None:
     """Cards left mid-step by a crash or restart go back to a state the user can act on."""
-    for card in cards.list_cards(statuses=["processing", "saving"]):
-        if card["status"] == "saving":
-            card["status"] = "save_failed"
-            card["error_kind"] = "unknown_outcome" if not card.get("resource_name") else "transient"
-            card["last_error"] = "저장 도중 봇이 재시작되었습니다. 저장 여부를 확인한 뒤 다시 시도합니다."
-            card["next_retry_at"] = time.time()
-        else:
-            card["status"] = "review"
-            draft = pipeline.current_draft(card)
-            draft.warnings.append("처리 도중 봇이 재시작됨: '인식 재시도'를 눌러주세요")
-            card["draft"] = draft.normalize().to_dict()
-        cards.add_history(card, "recovered_after_restart")
-        cards.save_card(card)
+    for candidate in cards.list_cards(statuses=["review", "processing", "saving"]):
+        with pipeline.card_lock(candidate["id"]):
+            card = cards.load_card(candidate["id"])
+            if not card:
+                continue
+            if pipeline.cancel_path(card["id"]).exists() and pipeline._cancel_locked(card):
+                continue
+            card.pop("recognition_id", None)
+            if card["status"] == "review":
+                if card.get("job_change_pending"):
+                    card["job_change_pending"] = False
+                    card.pop("job_change_started_at", None)
+                    card.pop("job_change_lookup_id", None)
+                    cards.save_card(card)
+                continue
+            if card["status"] == "saving":
+                card["status"] = "save_failed"
+                card["error_kind"] = "unknown_outcome" if not card.get("resource_name") else "transient"
+                card["last_error"] = "저장 도중 봇이 재시작되었습니다. 저장 여부를 확인한 뒤 다시 시도합니다."
+                card["next_retry_at"] = time.time()
+            elif card["status"] == "processing" and not pipeline.unresolved_save(card):
+                card["status"] = "review"
+                draft = pipeline.current_draft(card)
+                draft.warnings.append("처리 도중 봇이 재시작됨: '인식 재시도'를 눌러주세요")
+                card["draft"] = draft.normalize().to_dict()
+            else:
+                continue
+            cards.add_history(card, "recovered_after_restart")
+            cards.save_card(card)
 
 
 def _send_health_alert(token: str, text: str, *, apple_permission: bool = False,
@@ -440,6 +475,19 @@ def reject_chat(token: str, chat_id: int) -> None:
 
 # ---------------------------------------------------------------- photos
 
+def _report_stale_write(function):
+    """Tell the chat when a delayed UI write was refused; do not replay photos."""
+    from functools import wraps
+    @wraps(function)
+    def wrapped(token, chat_id, *args, **kwargs):
+        try:
+            return function(token, chat_id, *args, **kwargs)
+        except cards.StaleCardState:
+            send_message(token, chat_id, "저장 상태가 변경되어 요청을 반영하지 않았습니다. 이전 저장 결과를 확인하세요. 사진은 확인 후 다시 보내주세요.")
+    return wrapped
+
+
+@_report_stale_write
 def handle_photo(token: str, chat_id: int, message: dict, photos: list, data_dir: Path) -> Optional[tuple[int, str]]:
     media_group_id = message.get("media_group_id")
     reply_card = cards.find_by_message(chat_id, (message.get("reply_to_message") or {}).get("message_id"))
@@ -451,9 +499,24 @@ def handle_photo(token: str, chat_id: int, message: dict, photos: list, data_dir
             waiting = [c for c in cards.list_cards(chat_id, cards.REVIEW_STATUSES) if c.get("awaiting_back")]
             back_target = waiting[-1] if len(waiting) == 1 else None
     if back_target:
-        back_target["awaiting_back"] = False  # the next photo must not also go to this card
-        cards.save_card(back_target)
-        submit(process_back_photo, token, chat_id, photos, data_dir, back_target)
+        with pipeline.card_lock(back_target["id"], blocking=False) as acquired:
+            if not acquired:
+                send_message(token, chat_id, pipeline.BUSY_MESSAGE)
+                return None
+            fresh = cards.load_card(back_target["id"])
+            if fresh and fresh.get("status") in ("processing", "saving"):
+                send_message(token, chat_id, pipeline.BUSY_MESSAGE)
+                return None
+            if (not fresh or fresh.get("status") not in cards.REVIEW_STATUSES
+                    or pipeline.unresolved_save(fresh)):
+                send_message(token, chat_id, "이전 저장 결과를 먼저 확인하세요. 뒷면 사진을 반영하지 않았습니다. 확인 후 다시 보내주세요.")
+                return None
+            if not fresh.get("awaiting_back"):
+                send_message(token, chat_id, "뒷면 사진을 이미 받았습니다. 최근 초안을 확인하세요.")
+                return None
+            fresh["awaiting_back"] = False
+            cards.save_card(fresh)
+        submit(process_back_photo, token, chat_id, photos, data_dir, fresh)
         return None
     # Card creation happens here, in update order, so card numbers follow the
     # album; image prep, OCR and the model calls run on the worker pool.
@@ -464,8 +527,7 @@ def handle_photo(token: str, chat_id: int, message: dict, photos: list, data_dir
         submit(process_front_photo, token, chat_id, photos, data_dir, card, None, True, group=group)
         return group
     status_id = send_status(token, chat_id, f"{cards.label(card)} 처리 중: 이미지 보정 · OCR")
-    cards.remember_message(card, status_id)
-    cards.save_card(card)
+    _remember_card_message(card, status_id)
     submit(process_front_photo, token, chat_id, photos, data_dir, card, status_id)
     return None
 
@@ -482,12 +544,12 @@ def _ensure_group_progress(token: str, group: tuple[int, str]) -> None:
         cards.save_state("groups", state)
 
 
+@_report_stale_write
 def process_front_photo(token: str, chat_id: int, photos: list, data_dir: Path, card: dict, status_id: Optional[int] = None, album: bool = False) -> None:
     log.info("front photo chat=%s card=%s", chat_id, card["id"])
     if status_id is None and not album:
         status_id = send_status(token, chat_id, f"{cards.label(card)} 처리 중: 이미지 보정 · OCR")
-        cards.remember_message(card, status_id)
-        cards.save_card(card)
+        _remember_card_message(card, status_id)
     try:
         front_path = save_largest_photo(token, photos, chat_id, data_dir, "front", card["id"])
     except Exception:
@@ -499,8 +561,11 @@ def process_front_photo(token: str, chat_id: int, photos: list, data_dir: Path, 
         else:
             send_message(token, chat_id, text)
         return
-    card["images"]["front"] = str(front_path)
-    pipeline.recognize_front(card, front_path)
+    try:
+        pipeline.recognize_front(card, front_path)
+    except (pipeline.ContactSaveError, cards.StaleCardState) as exc:
+        send_message(token, chat_id, str(exc))
+        return
     profile = card["images"].get("profile")
     preview = Path(profile) if profile and Path(profile).exists() else None
     if album:
@@ -514,23 +579,47 @@ def process_front_photo(token: str, chat_id: int, photos: list, data_dir: Path, 
     show_draft(token, chat_id, card, status_id)
 
 
+@_report_stale_write
 def process_back_photo(token: str, chat_id: int, photos: list, data_dir: Path, card: dict) -> None:
     status_id = send_status(token, chat_id, f"{cards.label(card)} 처리 중: 뒷면 OCR")
     back_path = save_largest_photo(token, photos, chat_id, data_dir, "back", card["id"])
-    pipeline.recognize_back(card, back_path)
+    try:
+        pipeline.recognize_back(card, back_path)
+    except (pipeline.ContactSaveError, cards.StaleCardState) as exc:
+        send_message(token, chat_id, str(exc))
+        return
     show_draft(token, chat_id, card, status_id)
 
 
 CAPTION_LIMIT = 1024
+LOOKUP_APPLY_WAIT_SECONDS = 30.0
 
 
+@_report_stale_write
 def show_draft(token: str, chat_id: int, card: dict, replace_message_id: Optional[int] = None, prefix: str = "", photo: Optional[Path] = None) -> None:
+    with pipeline.card_lock(card["id"], blocking=False) as acquired:
+        if not acquired:
+            send_message(token, chat_id, pipeline.BUSY_MESSAGE)
+            return
+        fresh = cards.load_card(card["id"])
+        if not fresh or fresh.get("status") != "review" or pipeline.unresolved_save(fresh):
+            return
+        fresh.pop("job_choice", None)
+        fresh["job_change_pending"] = True
+        fresh["job_change_started_at"] = time.time()
+        fresh["job_change_lookup_id"] = uuid.uuid4().hex
+        cards.save_card(fresh)
+        card.clear()
+        card.update(fresh)
     text = (prefix + "\n\n" if prefix else "") + pipeline.draft_text(card) + "\n\n고칠 내용은 이 메시지에 답장으로 보내주세요."
+    text += "\n\n기존 연락처를 확인 중입니다. 확인 후 저장 버튼이 표시됩니다."
     message_id = None
+    is_caption = False
     if photo is not None:
         try:
             if len(text) <= CAPTION_LIMIT:
                 message_id = send_photo(token, chat_id, photo, text, reply_markup=draft_buttons(card))["result"]["message_id"]
+                is_caption = True
             else:
                 send_photo(token, chat_id, photo, f"{cards.label(card)} 연락처 사진 미리보기")
         except Exception:
@@ -544,16 +633,62 @@ def show_draft(token: str, chat_id: int, card: dict, replace_message_id: Optiona
     if message_id is None:
         message_id = send_message(token, chat_id, text, reply_markup=draft_buttons(card))["result"]["message_id"]
     _remember_card_message(card, message_id)
+    # Deliver the draft first. Optional contact lookup never adds to first-draft latency.
+    # show_draft is called by photo/edit workers, never by the update loop.
+    # Finish on that same worker so shutdown waits for the lookup as well.
+    _complete_job_change(token, chat_id, dict(card), message_id, prefix, is_caption)
+
+
+def _complete_job_change(token: str, chat_id: int, candidate: dict, message_id: int,
+                         prefix: str, is_caption: bool) -> None:
+    pipeline.refresh_job_change(candidate)
+    deadline = time.monotonic() + LOOKUP_APPLY_WAIT_SECONDS
+    delay = .05
+    while True:
+        with pipeline.card_lock(candidate["id"], blocking=False) as acquired:
+            if acquired:
+                fresh = cards.finish_job_change(candidate)
+                break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            log.warning("job-change completion lock timeout; using normal save")
+            fresh = cards.finish_job_change(candidate, fallback=True)
+            break
+        time.sleep(min(delay, remaining))
+        delay = min(delay * 2, .5)
+    if fresh is None:
+        return
+    text = (prefix + "\n\n" if prefix else "") + pipeline.draft_text(fresh) + "\n\n고칠 내용은 이 메시지에 답장으로 보내주세요."
+    try:
+        if is_caption and len(text) <= CAPTION_LIMIT:
+            api_post(token, "editMessageCaption", {"chat_id": chat_id, "message_id": message_id,
+                     "caption": text, "reply_markup": draft_buttons(fresh)})
+        elif is_caption:
+            api_post(token, "editMessageReplyMarkup", {"chat_id": chat_id, "message_id": message_id,
+                     "reply_markup": {"inline_keyboard": []}})
+            result = send_message(token, chat_id, text, reply_markup=draft_buttons(fresh))
+            _remember_card_message(fresh, result["result"]["message_id"])
+        else:
+            edit_message(token, chat_id, message_id, text, reply_markup=draft_buttons(fresh))
+    except Exception:
+        log.warning("job-change draft refresh unavailable card=%s", fresh["id"])
+
+
+def _record_card_message_locked(card: dict, message_id: Optional[int]) -> None:
+    """Record into the current card; the caller already owns its card lock."""
+    cards.remember_message(card, message_id)
+    cards.save_card(card)
 
 
 def _remember_card_message(card: dict, message_id: Optional[int]) -> None:
-    with pipeline.card_lock(card["id"]):
-        fresh = cards.load_card(card["id"])
-        if fresh is not None:
-            cards.remember_message(fresh, message_id)
-            cards.save_card(fresh)
-            card.clear()
-            card.update(fresh)
+    with cards.pending_message(card, message_id):
+        # v2.1.1: block in the calling thread, reload, append once, save, refresh.
+        with pipeline.card_lock(card["id"]):
+            fresh = cards.load_card(card["id"])
+            if fresh is not None:
+                _record_card_message_locked(fresh, message_id)
+                card.clear()
+                card.update(fresh)
 
 
 def send_group_summary(token: str, chat_id: int, media_group_id: str) -> None:
@@ -590,6 +725,9 @@ def handle_text(token: str, chat_id: int, message: dict) -> None:
     if text.lower() in HELP_WORDS:
         send_message(token, chat_id, HELP_TEXT)
         return
+    if text.lower() in ("/alerts", "알림 설정"):
+        send_alerts_menu(token, chat_id)
+        return
     if text.lower() in LIST_WORDS:
         send_open_list(token, chat_id)
         return
@@ -615,7 +753,7 @@ def handle_text(token: str, chat_id: int, message: dict) -> None:
         edit_message(token, chat_id, status_id, f"{cards.label(card)} {note}")
         _remember_card_message(card, status_id)
         return
-    show_draft(token, chat_id, card, status_id, prefix=f"{cards.label(card)} {note}")
+    submit(show_draft, token, chat_id, card, status_id, f"{cards.label(card)} {note}")
 
 
 def send_open_list(token: str, chat_id: int) -> None:
@@ -624,6 +762,10 @@ def send_open_list(token: str, chat_id: int) -> None:
         send_message(token, chat_id, "저장 안 된 명함이 없습니다.")
         return
     text, markup = batch_summary(open_cards, "all", "저장 안 된 명함")
+    edit_rows = [[{"text": f"{cards.label(card)} 직접 수정", "callback_data": f"ed:{card['id']}"}]
+                 for card in open_cards if card["status"] in cards.REVIEW_STATUSES]
+    if edit_rows:
+        markup = {"inline_keyboard": (markup or {}).get("inline_keyboard", []) + edit_rows}
     if any(card["status"] in cards.REVIEW_STATUSES for card in open_cards):
         text += "\n\n검토 중이거나 저장 보류된 명함을 고치려면 해당 초안 메시지에 답장하세요."
     send_message(token, chat_id, text, reply_markup=markup)
@@ -636,8 +778,7 @@ def send_open_list(token: str, chat_id: int) -> None:
 
 def handle_callback(token: str, callback: dict, chat_id: int) -> None:
     callback_id = callback.get("id")
-    is_confirmation = str(callback.get("data") or "").split(":", 1)[0] in ("cs", "cr", "ck")
-    if callback_id and not is_confirmation:
+    if callback_id:
         try:
             api_post(token, "answerCallbackQuery", {"callback_query_id": callback_id})
         except Exception:
@@ -646,10 +787,32 @@ def handle_callback(token: str, callback: dict, chat_id: int) -> None:
     data = str(callback.get("data") or "")
     log.info("callback chat=%s data=%s", chat_id, data)
     action, _, rest = data.partition(":")
+    if action in ("ae", "ad"):
+        if chat_id not in allowed_chat_ids():
+            return
+        with cards.followup_lock:
+            state = cards.initialize_followup()
+            state["enabled"] = action == "ae"
+            cards.save_state("followup", state)
+        send_alerts_menu(token, chat_id)
+        return
+    if action in ("fm", "fl", "fx", "fo"):
+        if chat_id not in allowed_chat_ids():
+            return
+        card_id, _, nonce = rest.partition(":")
+        outcome = pipeline.resolve_followup(card_id, chat_id,
+                                            {"fm": "sent", "fl": "later", "fx": "stop", "fo": "off"}[action], nonce)
+        message_id = (callback.get("message") or {}).get("message_id")
+        markup = alerts_buttons(False) if outcome["ok"] and action == "fo" else {"inline_keyboard": []}
+        if outcome["ok"] and message_id:
+            edit_message(token, chat_id, message_id, outcome["message"], reply_markup=markup)
+        else:
+            send_message(token, chat_id, outcome["message"], reply_markup=markup)
+        return
     if action == "ba":
         submit(approve_batch, token, chat_id, rest)
         return
-    if action not in ("ap", "cx", "ed", "bk", "rs", "sv", "cs", "cr", "ck"):
+    if action not in ("ap", "ju", "jn", "cx", "ed", "bk", "rs", "sv", "cs", "cr", "ck"):
         send_message(token, chat_id, "예전 버튼입니다. 최근 초안 메시지의 버튼을 눌러주세요. ('목록'으로 확인)")
         return
     card_id, _, revision = rest.partition(":")
@@ -661,33 +824,54 @@ def handle_callback(token: str, callback: dict, chat_id: int) -> None:
     if action in ("cs", "cr", "ck"):
         # Nonce is independent of the draft revision; old numeric callbacks are stale.
         submit(confirm_card, token, chat_id, card, {"cs": "saved", "cr": "again", "ck": "skip"}[action], revision, callback)
+    elif action in ("ju", "jn"):
+        if not revision.isdigit():
+            send_message(token, chat_id, "최근 초안의 버튼을 눌러주세요.")
+            return
+        submit(approve_card, token, chat_id, card, int(revision), "update" if action == "ju" else "new")
     elif action in ("ap", "sv"):
         submit(approve_card, token, chat_id, card, int(revision) if revision.isdigit() and action == "ap" else None)
     elif action == "cx":
         if card["status"] == "saved":
             send_message(token, chat_id, f"{cards.label(card)}은(는) 이미 저장되어 취소할 수 없습니다.")
             return
-        if pipeline.cancel(card):
+        if pipeline.cancel(card, blocking=False, defer_processing=True):
             send_message(token, chat_id, f"{cards.label(card)} 취소했습니다.")
+        elif card.get("cancel_requested"):
+            send_message(token, chat_id, f"{cards.label(card)} 인식이 끝나면 취소합니다")
+            # Close the marker-write/recognition-finish race without making the
+            # update thread wait. An active recognition consumes it in finally.
+            if _executor is None:
+                threading.Thread(target=pipeline.finish_cancel_request,
+                                 args=(card["id"],), daemon=True).start()
+            else:
+                submit(pipeline.finish_cancel_request, card["id"])
+        elif card.get("status") in ("processing", "saving", "review"):
+            send_message(token, chat_id, pipeline.BUSY_MESSAGE)
         else:
             send_message(token, chat_id, f"{cards.label(card)} 저장이 시작되었거나 종료되어 취소하지 못했습니다.")
     elif action in ("ed", "bk", "rs"):
         _handle_draft_callback(token, chat_id, card, action)
 
 
+@_report_stale_write
 def _handle_draft_callback(token: str, chat_id: int, card: dict, action: str) -> None:
     # Do not block polling behind a slow Contacts write or mutate its version.
     with pipeline.card_lock(card["id"], blocking=False) as acquired:
         if not acquired:
-            send_message(token, chat_id, f"{cards.label(card)} 저장 중입니다. 잠시 후 다시 눌러주세요.")
+            send_message(token, chat_id, f"{cards.label(card)} {pipeline.BUSY_MESSAGE}")
             return
         fresh = cards.load_card(card["id"])
         if not fresh or fresh["status"] not in cards.REVIEW_STATUSES:
-            note = "저장 중입니다." if fresh and fresh["status"] == "saving" else "지금은 수정할 수 없는 상태입니다. 최근 안내를 확인하세요."
+            note = pipeline.BUSY_MESSAGE if fresh and fresh["status"] in ("processing", "saving") else "지금은 수정할 수 없는 상태입니다. 최근 안내를 확인하세요."
             send_message(token, chat_id, f"{cards.label(card)} {note}")
             return
         card.clear()
         card.update(fresh)
+        if pipeline.unresolved_save(card):
+            send_message(token, chat_id, "이전 저장 결과를 먼저 확인하세요. 확인 전에는 초안을 수정할 수 없습니다.",
+                         reply_markup=saved_failed_buttons(card))
+            return
         if action == "rs":
             if not card["images"].get("front") or not Path(card["images"]["front"]).exists():
                 send_message(token, chat_id, f"{cards.label(card)} 원본 사진이 없어 재인식할 수 없습니다. 사진을 다시 보내주세요.")
@@ -704,14 +888,19 @@ def _handle_draft_callback(token: str, chat_id: int, card: dict, action: str) ->
                 prompt = f"{cards.label(card)} 뒷면 사진을 이 메시지에 답장으로 보내주세요."
                 markup = {"force_reply": True}
             result = send_message(token, chat_id, prompt, reply_markup=markup)
-            cards.remember_message(card, result["result"]["message_id"])
-            cards.save_card(card)
+            message_id = result["result"]["message_id"]
+            with cards.pending_message(card, message_id):
+                _record_card_message_locked(card, message_id)
     if action == "rs":
         submit(_recognize_again, token, chat_id, card, status_id)
 
 
 def _recognize_again(token: str, chat_id: int, card: dict, status_id: int) -> None:
-    pipeline.recognize_front(card)
+    try:
+        pipeline.recognize_front(card)
+    except (pipeline.ContactSaveError, cards.StaleCardState) as exc:
+        send_message(token, chat_id, str(exc))
+        return
     show_draft(token, chat_id, card, status_id)
 
 
@@ -719,12 +908,6 @@ def confirm_card(token: str, chat_id: int, card: dict, choice: str, confirmation
                  callback: Optional[dict] = None) -> None:
     outcome = pipeline.resolve_confirmation(card, choice, confirmation_id)
     callback = callback or {}
-    if callback.get("id"):
-        try:
-            api_post(token, "answerCallbackQuery", {"callback_query_id": callback["id"],
-                     "text": "이미 처리됨" if outcome.get("stale") else "처리했습니다"})
-        except Exception:
-            log.warning("confirmation callback answer failed")
     message_id = (callback.get("message") or {}).get("message_id")
     if message_id is not None:
         try:
@@ -732,19 +915,21 @@ def confirm_card(token: str, chat_id: int, card: dict, choice: str, confirmation
                      "reply_markup": {"inline_keyboard": []}})
         except Exception:
             log.warning("confirmation keyboard removal failed")
-    if not outcome.get("stale"):
+    if outcome.get("stale"):
+        send_message(token, chat_id, "이미 처리됨: 최근 안내를 확인하세요.")
+    else:
         text = save_result_text(card, outcome) if choice == "again" else outcome["message"]
         send_message(token, chat_id, text,
-                     reply_markup=None if outcome["ok"] else saved_failed_buttons(card))
+                              reply_markup=None if outcome["ok"] else saved_failed_buttons(card))
 
 
-def approve_card(token: str, chat_id: int, card: dict, revision: Optional[int]) -> dict:
+def approve_card(token: str, chat_id: int, card: dict, revision: Optional[int], job_choice: Optional[str] = None) -> dict:
     display = pipeline.current_draft(card).display_name
     status_id = send_status(token, chat_id, f"{cards.label(card)} 저장 중: {display}")
-    outcome = pipeline.approve(card, revision)
+    _remember_card_message(card, status_id)
+    outcome = pipeline.approve(card, revision, job_choice=job_choice) if job_choice else pipeline.approve(card, revision)
     markup = None if outcome["ok"] or outcome.get("stale") else (draft_buttons(card) if outcome.get("invalid") else saved_failed_buttons(card))
     edit_message(token, chat_id, status_id, save_result_text(card, outcome), reply_markup=markup)
-    _remember_card_message(card, status_id)
     return outcome
 
 
@@ -753,9 +938,14 @@ def approve_batch(token: str, chat_id: int, scope: str) -> None:
         members = cards.group_cards(chat_id, scope[2:])
     else:
         members = cards.list_cards(chat_id, cards.REVIEW_STATUSES)
-    targets = [c for c in members if c["status"] == "review" and pipeline.current_draft(c).is_savable]
+    targets = [c for c in members if c["status"] == "review" and pipeline.current_draft(c).is_savable and not c.get("job_change") and not c.get("job_change_pending")]
+    choices = [c for c in members if c["status"] == "review" and c.get("job_change")]
+    for card in choices:
+        send_message(token, chat_id, f"{cards.label(card)} {pipeline.current_draft(card).display_name}: 일괄 저장에서 제외했습니다. 갱신 방법을 선택하세요.",
+                              reply_markup={"inline_keyboard": [draft_buttons(card)["inline_keyboard"][0]]})
     if not targets:
-        send_message(token, chat_id, "저장할 수 있는 명함이 없습니다.")
+        if not choices:
+            send_message(token, chat_id, "저장할 수 있는 명함이 없습니다.")
         return
     status_id = send_status(token, chat_id, f"{len(targets)}건 저장 중… ({contacts.destination_name()}에 한 건씩 저장합니다)")
     lines = []
@@ -775,7 +965,7 @@ def approve_batch(token: str, chat_id: int, scope: str) -> None:
     skipped = [c for c in members if c["status"] == "review" and c not in targets]
     text = f"일괄 저장 {ok}/{len(targets)}건 완료\n" + "\n".join(lines)
     if skipped:
-        text += f"\n\n입력이 더 필요한 {len(skipped)}건은 그대로 남겨두었습니다."
+        text += f"\n\n별도 확인이 필요한 {len(skipped)}건은 남겨두었습니다. 각 초안의 버튼을 눌러주세요."
     if ok < len(targets):
         text += "\n저장 보류된 명함은 자동으로 다시 시도합니다."
     edit_message(token, chat_id, status_id, text)
@@ -786,12 +976,115 @@ def approve_batch(token: str, chat_id: int, scope: str) -> None:
             log.exception("group summary refresh failed")
 
 
+def alerts_buttons(enabled: bool) -> dict:
+    return {"inline_keyboard": [[{"text": "알림 끄기" if enabled else "알림 다시 켜기",
+                                  "callback_data": "ad" if enabled else "ae"}]]}
+
+
+def send_alerts_menu(token: str, chat_id: int) -> None:
+    enabled = cards.initialize_followup().get("enabled", True)
+    message = "후속 알림이 켜져 있습니다." if enabled else "후속 알림이 꺼져 있습니다."
+    if not cards.followup_days():
+        message += " BIZCARD_FOLLOWUP_DAYS=0이므로 발송하지 않습니다. 일수를 설정한 뒤 봇을 다시 시작하세요."
+    else:
+        message += " 다시 켜면 대기 중인 알림과 앞으로 저장하는 명함에 적용합니다."
+    send_message(token, chat_id, message, reply_markup=alerts_buttons(enabled))
+
+
+def followup_buttons(card: dict) -> dict:
+    suffix = f"{card['id']}:{card['followup_nonce']}"
+    return {"inline_keyboard": [
+        [{"text": "보냈어요", "callback_data": f"fm:{suffix}"},
+         {"text": "3일 뒤 다시", "callback_data": f"fl:{suffix}"}],
+        [{"text": "이 명함은 그만", "callback_data": f"fx:{suffix}"},
+         {"text": "알림 끄기", "callback_data": f"fo:{suffix}"}]]}
+
+
+def send_followup_message(token: str, card: dict) -> dict:
+    chat_id = int(card["chat_id"])
+    _pace(chat_id)
+    # Telegram has no sendMessage idempotency key. One attempt, including 429;
+    # failures retain the durable 'sending' claim and are never auto-retried.
+    return api_post(token, "sendMessage", {"chat_id": chat_id,
+                    "text": followup_text(card)[:4000], "reply_markup": followup_buttons(card)}, attempts=1)
+
+
+def _safe_send_due_followups(token: str) -> None:
+    try:
+        send_due_followups(token)
+    except Exception:
+        log.warning("follow-up scan failed; continuing polling")
+
+
+@pipeline.stale_safe("none")
+def send_due_followups(token: str) -> None:
+    now = time.time()
+    if not 10 <= cards.followup_localtime(now).hour < 19:
+        return
+    if not cards.followup_days() or not cards.initialize_followup().get("enabled", True):
+        return
+    allowed = allowed_chat_ids()
+    for candidate in cards.list_cards(statuses=["saved"]):
+        if candidate.get("followup_state") != "pending" or (candidate.get("followup_due_at") or float("inf")) > now:
+            continue
+        with pipeline.card_lock(candidate["id"], blocking=False) as acquired:
+            if not acquired:
+                continue
+            card = _claim_due_followup_locked(candidate, allowed)
+        if card is None:
+            continue
+        try:
+            result = send_followup_message(token, card)
+        except Exception:
+            log.warning("follow-up delivery uncertain card=%s", card["id"])
+            continue
+        message_id = (result.get("result") or {}).get("message_id")
+        with cards.pending_message(card, message_id):
+            with pipeline.card_lock(card["id"]):
+                with cards.followup_lock:
+                    fresh = cards.load_card(card["id"])
+                    if (not fresh or fresh.get("status") != "saved"
+                            or fresh.get("chat_id") != card.get("chat_id")
+                            or fresh.get("followup_nonce") != card.get("followup_nonce")
+                            or fresh.get("followup_state") != "sending"):
+                        continue
+                    fresh.update(followup_state="notified", followup_message_id=message_id)
+                    _record_card_message_locked(fresh, message_id)
+
+
+def _claim_due_followup_locked(candidate: dict, allowed: set) -> Optional[dict]:
+    with cards.followup_lock:
+        now = time.time()
+        if not 10 <= cards.followup_localtime(now).hour < 19:
+            return
+        card = cards.load_card(candidate["id"])
+        if (not card or card.get("status") != "saved" or card.get("followup_state") != "pending"
+                or card.get("followup_nonce") != candidate.get("followup_nonce")
+                or (card.get("followup_due_at") or float("inf")) > now
+                or not cards.initialize_followup().get("enabled", True)):
+            return
+        if str(card.get("chat_id")) not in {str(value) for value in allowed}:
+            return
+        # Durable at-most-once claim precedes the network call. A crash or
+        # timeout leaves 'sending'; restart must not risk a duplicate message.
+        card.update(followup_state="sending", followup_nonce=secrets.token_hex(8))
+        cards.save_card(card)
+        return card
+
 def draft_buttons(card: dict) -> dict:
+    if pipeline.unresolved_save(card):
+        return saved_failed_buttons(card)
     cid, rev = card["id"], card.get("revision") or 0
     rows = [
         [{"text": "저장", "callback_data": f"ap:{cid}:{rev}"}, {"text": "직접 수정", "callback_data": f"ed:{cid}"}],
         [{"text": "뒷면 추가", "callback_data": f"bk:{cid}"}, {"text": "인식 재시도", "callback_data": f"rs:{cid}"}, {"text": "취소", "callback_data": f"cx:{cid}"}],
     ]
+    if pipeline.job_change_pending_active(card):
+        rows[0] = [{"text": "직접 수정", "callback_data": f"ed:{cid}"}]
+    elif card.get("job_change") and not card.get("job_change_pending"):
+        rows[0] = [{"text": "기존 연락처 갱신", "callback_data": f"ju:{cid}:{rev}"},
+                   {"text": "새 연락처로 저장", "callback_data": f"jn:{cid}:{rev}"}]
+        rows.insert(1, [{"text": "직접 수정", "callback_data": f"ed:{cid}"}])
     return {"inline_keyboard": rows}
 
 
@@ -799,10 +1092,14 @@ def saved_failed_buttons(card: dict) -> dict:
     cid = card["id"]
     if card.get("status") == "needs_confirmation":
         rev = pipeline.confirmation_token(card)
+        if not rev:
+            return {"inline_keyboard": []}
         return {"inline_keyboard": [[
             {"text": "이미 저장됨", "callback_data": f"cs:{cid}:{rev}"},
             {"text": "다시 저장", "callback_data": f"cr:{cid}:{rev}"},
             {"text": "건너뛰기", "callback_data": f"ck:{cid}:{rev}"}]]}
+    if pipeline.unresolved_save(card):
+        return {"inline_keyboard": [[{"text": "이전 저장 확인", "callback_data": f"sv:{cid}"}]]}
     return {"inline_keyboard": [[{"text": "지금 다시 저장", "callback_data": f"sv:{cid}"}, {"text": "직접 수정", "callback_data": f"ed:{cid}"}, {"text": "취소", "callback_data": f"cx:{cid}"}]]}
 
 
@@ -913,14 +1210,15 @@ RATE_LIMIT_WAITS = 8
 
 def with_retry(call, label: str, attempts: int = RETRY_ATTEMPTS):
     """Retry transient network failures; wait out Telegram's 429 retry_after
-    (not counted as a failed attempt); fail fast on other 4xx."""
+    (not counted as a failed attempt); attempts=1 disables all retries and waits.
+    Fail fast on other 4xx."""
     attempt, rate_waits = 1, 0
     while True:
         try:
             return call()
         except HTTPError as exc:
             body = _http_error_body(exc)
-            if exc.code == 429 and rate_waits < RATE_LIMIT_WAITS:
+            if exc.code == 429 and attempts != 1 and rate_waits < RATE_LIMIT_WAITS:
                 rate_waits += 1
                 delay = float(((body or {}).get("parameters") or {}).get("retry_after") or RETRY_DELAY * rate_waits)
                 log.warning("%s rate limited; waiting %.0fs (%d/%d)", label, delay, rate_waits, RATE_LIMIT_WAITS)
@@ -964,7 +1262,7 @@ def api_get(token: str, method: str, params: Optional[dict] = None, timeout: int
     return payload
 
 
-def api_post(token: str, method: str, payload: dict) -> dict:
+def api_post(token: str, method: str, payload: dict, *, attempts: Optional[int] = None) -> dict:
     request = Request(
         method_url(token, method),
         data=json.dumps(payload).encode("utf-8"),
@@ -976,7 +1274,7 @@ def api_post(token: str, method: str, payload: dict) -> dict:
         with urlopen(request, timeout=10) as response:
             return json.loads(response.read().decode("utf-8"))
 
-    result = with_retry(call, f"Telegram {method}")
+    result = with_retry(call, f"Telegram {method}", attempts=attempts) if attempts is not None else with_retry(call, f"Telegram {method}")
     if result.get("ok") is not True:
         raise RuntimeError(result.get("description") or f"Telegram {method} failed")
     return result
@@ -1015,9 +1313,9 @@ def setup_logging() -> None:
         log.warning("could not open log file; continuing with stderr only")
 
 
-def main() -> None:
+def main() -> Optional[int]:
     setup_logging()
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
         raise SystemExit("TELEGRAM_BOT_TOKEN is required")
-    run(token)
+    return run(token)

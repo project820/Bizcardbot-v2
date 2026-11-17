@@ -127,6 +127,7 @@ class AppleTests(unittest.TestCase):
         with patch.dict(os.environ, {"BIZCARD_CONTACTS_BACKEND": "typo"}), self.assertRaises(contacts.ContactSaveError):
             backend.save_contact(draft(), None)
 
+    @patch.object(telegram, "setup_logging", lambda: None)
     def test_setup_apple_saves_only_selected_settings_safely(self):
         apple = self.apple()
         with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {}, clear=True):
@@ -144,6 +145,7 @@ class AppleTests(unittest.TestCase):
             self.assertEqual(settings["KEEP"], "literal")
             self.assertEqual(env.stat().st_mode & 0o777, 0o600)
 
+    @patch.object(telegram, "setup_logging", lambda: None)
     def test_setup_google_does_not_request_apple_permission(self):
         apple = self.apple()
         with tempfile.TemporaryDirectory() as folder, patch.dict(os.environ, {}, clear=True), patch.object(

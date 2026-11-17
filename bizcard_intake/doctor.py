@@ -9,8 +9,9 @@ import subprocess
 from dataclasses import dataclass
 from typing import Callable, Optional
 from urllib.request import urlopen
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from . import parser, apple_contacts, contact_backend
+from . import parser, apple_contacts, contact_backend, writer
 from .contacts import CONTACTS_SCOPE, LOGIN_COMMAND, ContactSaveError, gws_auth_status, run_gws
 from .image_processing import _ensure_vision_rectifier
 from .vision_ocr import _ensure_vision_ocr
@@ -133,12 +134,33 @@ def check_telegram() -> Check:
     return Check("telegram", True, f"@{username}")
 
 
+def check_timezone() -> Check:
+    zone = os.environ.get("BIZCARD_TZ", "").strip()
+    if zone:
+        try:
+            ZoneInfo(zone)
+        except (ZoneInfoNotFoundError, ValueError):
+            return Check("timezone", True, "경고: BIZCARD_TZ가 올바르지 않아 시스템 시간대를 사용합니다. Asia/Seoul처럼 지정하세요.")
+    return Check("timezone", True, "알림 시간대 설정을 확인했습니다.")
+
+
+def check_writer() -> Check:
+    try:
+        held = writer.is_held()
+    except OSError:
+        return Check("writer", False, "작성자 잠금 상태를 확인하지 못했습니다.", "데이터 폴더 권한을 확인하세요.")
+    detail = "사용 중: 실행 중인 봇 또는 CLI가 작성자 잠금을 보유합니다." if held else "비어 있음: 작성자 잠금을 사용할 수 있습니다."
+    return Check("writer", True, detail)
+
+
 CHECKS: dict[str, Callable[[], Check]] = {
     "python": check_python,
     "vision": check_vision,
     "gws": check_gws,
     "parser": check_parser,
     "telegram": check_telegram,
+    "timezone": check_timezone,
+    "writer": check_writer,
 }
 
 

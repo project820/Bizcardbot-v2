@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from bizcard_intake import cli, pipeline, telegram
+from bizcard_intake import cards, cli, pipeline, telegram
 
 
 class BotStartupTest(unittest.TestCase):
@@ -16,6 +16,9 @@ class BotStartupTest(unittest.TestCase):
         root = patch.object(cli, "PROJECT_ROOT", Path(folder.name))
         root.start()
         self.addCleanup(root.stop)
+        storage = patch.object(cards, "CARD_DIR", Path(folder.name) / "cards")
+        storage.start()
+        self.addCleanup(storage.stop)
 
     def test_bot_requires_telegram_token(self):
         with patch.dict(os.environ, {}, clear=True), patch.object(telegram, "main") as run:
@@ -43,6 +46,7 @@ class ProjectSettingsTest(unittest.TestCase):
         self.root = Path(folder.name)
         for context in (
             patch.object(cli, "PROJECT_ROOT", self.root),
+            patch.object(cards, "CARD_DIR", self.root / "cards"),
             patch.dict(os.environ, {}, clear=True),
             patch.object(telegram, "setup_logging"),
             redirect_stdout(io.StringIO()),

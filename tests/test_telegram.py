@@ -31,6 +31,13 @@ class FakeTelegram:
         self.photos.append((caption, reply_markup, self.next_id))
         return {"result": {"message_id": self.next_id}}
 
+    def api_post(self, token, method, payload):
+        if method == "editMessageCaption":
+            for index, (caption, markup, message_id) in enumerate(self.photos):
+                if message_id == payload["message_id"]:
+                    self.photos[index] = (payload["caption"], payload.get("reply_markup"), message_id)
+        return {"ok": True}
+
     def all_texts(self):
         return [t for t, _, _ in self.sent] + [t for t, _, _ in self.edited] + [c for c, _, _ in self.photos]
 
@@ -78,14 +85,21 @@ class TelegramTest(unittest.TestCase):
         self.tmp = Path(self._tmp.name)
         self.tg = FakeTelegram()
         self.patches = [
-            patch.dict(os.environ, ALLOWED),
+            patch.object(pipeline.contact_backend, "find_job_change_candidate", return_value=None),
+            patch.object(pipeline.contact_backend.contacts, "run_gws", return_value={"connections": []}),
+            patch.dict(os.environ, {**ALLOWED, "BIZCARD_CONTACTS_BACKEND": "google"}),
+            patch.object(telegram, "_executor", None),
+            patch.object(telegram, "_summary_token", ""),
+            patch.object(telegram, "_group_pending", {}),
+            patch.object(telegram, "_group_summary_wanted", set()),
+            patch.object(telegram, "_progress_at", {}),
             patch.object(cards, "CARD_DIR", self.tmp / "cards"),
             patch.object(pipeline, "SESSION_ARCHIVE_DIR", self.tmp / "archive"),
             patch.object(telegram, "send_message", self.tg.send_message),
             patch.object(telegram, "edit_message", self.tg.edit_message),
             patch.object(telegram, "send_photo", self.tg.send_photo),
             patch.dict(os.environ, {"BIZCARD_TELEGRAM_INTERVAL": "0"}),
-            patch.object(telegram, "api_post", lambda token, method, payload: {"ok": True}),
+            patch.object(telegram, "api_post", self.tg.api_post),
             patch.object(telegram, "api_get", lambda token, method, params=None, timeout=10: {"result": {"file_path": f"photos/{params['file_id']}.jpg"}}),
             patch.object(telegram, "download_file", lambda token, file_path: b"jpg"),
         ]
@@ -93,12 +107,74 @@ class TelegramTest(unittest.TestCase):
             p.start()
 
     def tearDown(self):
-        for p in self.patches:
+        for p in reversed(self.patches):
             p.stop()
         self._tmp.cleanup()
 
     def run_updates(self, updates):
         telegram.handle_updates("token", updates, self.tmp / "photos")
+
+    def test_optional_lookup_fixture_never_spawns_subprocess(self):
+        card = cards.new_card(42)
+        pipeline.set_draft(card, CardDraft(name='Test', mobile=['010-0000-1234']), 'test')
+        card['status'] = 'review'
+        cards.save_card(card)
+        with patch('subprocess.run', side_effect=AssertionError('lookup leaked subprocess')) as spawn:
+            pipeline.refresh_job_change(card)
+            self.assertEqual(spawn.call_count, 0)
+
+    def test_album_batch_fixture_never_spawns_subprocess(self):
+        with patch.object(pipeline, "scan_front", fake_scan(["가", "나"])), patch.object(
+            pipeline, "save_contact", lambda d, i, **kw: SaveResult("created", "people/fixture")
+        ), patch("subprocess.run", side_effect=AssertionError("album leaked subprocess")) as spawn:
+            self.run_updates([photo_update(1, "a", "ISOLATED"), photo_update(2, "b", "ISOLATED")])
+            self.run_updates([callback(3, "ba:g:ISOLATED")])
+            self.assertEqual(spawn.call_count, 0)
+        self.assertTrue(all(c["status"] == "saved" for c in cards.list_cards()))
+
+    def test_first_draft_does_not_wait_for_job_lookup(self):
+        import time
+        sent = []
+        def slow_lookup(value):
+            time.sleep(0.15)
+            return None
+        start = time.monotonic()
+        with patch.object(pipeline, 'scan_front', fake_scan(['Test'])), patch.object(pipeline.contact_backend, 'find_job_change_candidate', side_effect=slow_lookup), patch.object(telegram, 'edit_message', side_effect=lambda *a, **k: sent.append(time.monotonic())):
+            self.run_updates([photo_update(1, 'fixture')])
+        self.assertTrue(sent)
+        self.assertLess(sent[0] - start, 0.10)
+
+    def test_job_candidate_buttons_arrive_after_initial_draft(self):
+        seen_initial = []
+        def lookup(value):
+            seen_initial.append(bool(self.tg.edited))
+            return {'resourceName': 'people/fixture', 'organizations': [{'name': 'Old Fixture', 'title': 'Old Role'}]}
+        with patch.object(pipeline, 'scan_front', fake_scan(['Test'])), patch.object(pipeline.contact_backend, 'find_job_change_candidate', side_effect=lookup):
+            self.run_updates([photo_update(1, 'fixture')])
+        self.assertEqual(seen_initial, [True])
+        labels = [b['text'] for row in self.tg.edited[-1][1]['inline_keyboard'] for b in row]
+        self.assertIn('기존 연락처 갱신', labels)
+        self.assertIn('새 연락처로 저장', labels)
+
+    def test_candidate_lookup_cannot_overwrite_newer_revision(self):
+        def lookup(value):
+            card = cards.list_cards(42)[0]
+            pipeline.set_draft(card, CardDraft(name='Edited', mobile=['010-0000-9999']), 'newer')
+            cards.save_card(card)
+            return {'resourceName': 'people/old', 'organizations': [{'name': 'Old Fixture', 'title': 'Old Role'}]}
+        with patch.object(pipeline, 'scan_front', fake_scan(['Test'])), patch.object(pipeline.contact_backend, 'find_job_change_candidate', side_effect=lookup):
+            self.run_updates([photo_update(1, 'fixture')])
+        card = cards.list_cards(42)[0]
+        self.assertEqual(card['draft']['name'], 'Edited')
+        self.assertIsNone(card.get('job_change'))
+        self.assertEqual(len(self.tg.edited), 1)
+
+    def test_restart_clears_interrupted_optional_lookup(self):
+        card = cards.new_card(42)
+        card.update(status='review', job_change_pending=True)
+        cards.save_card(card)
+        telegram.recover_interrupted()
+        self.assertFalse(cards.load_card(card['id'])['job_change_pending'])
 
     def test_shared_ux_names_are_reexported(self):
         for name in ('HELP_TEXT', 'save_result_text', 'edit_prompt', 'batch_summary', 'select_card'):
@@ -213,7 +289,8 @@ class TelegramTest(unittest.TestCase):
         with patch.object(pipeline, "scan_front", fake_scan(["가", "나"])):
             self.run_updates([photo_update(1, "a"), photo_update(2, "b")])
         first, second = cards.list_cards()
-        target_message = first["message_ids"][-1]
+        target_message = next(mid for _, _, mid in self.tg.sent
+                              if (cards.find_by_message(42, mid) or {}).get('id') == first['id'])
         with patch.object(pipeline, "revise_draft", side_effect=AssertionError("no AI for field edits")):
             self.run_updates([text_update(3, "직함: 영업팀장\n회사: 누리네트웍스", reply_to=target_message)])
         self.assertEqual(pipeline.current_draft(cards.load_card(first["id"])).display_name, "가 영업팀장 누리네트웍스")
@@ -305,7 +382,7 @@ class TelegramTest(unittest.TestCase):
                     return int(ok), [] if ok else ["result"]
 
                 with patch.object(pipeline, "retry_due", side_effect=retry) as retried, patch.object(
-                    telegram, "send_message"
+                    telegram, "send_message", return_value={"result": {"message_id": 999}}
                 ) as send:
                     telegram.retry_due_and_report("token", force=force)
                 self.assertEqual(retried.call_args.kwargs["force"], force)
