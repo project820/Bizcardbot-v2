@@ -113,7 +113,7 @@ def cmd_scan(image: Path) -> int:
     except (pipeline.ContactSaveError, cards.StaleCardState) as exc:
         print(str(exc), file=sys.stderr)
         return 1
-    print(pipeline.draft_text(card))
+    print(pipeline.draft_text(card, show_cost=True))
     print(f"\n[rectifier={card.get('rectifier')}] 명함 ID: {card['id']}")
     print(f"저장하려면: python -m bizcard_intake save {card['id']}")
     return 0

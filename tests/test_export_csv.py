@@ -46,6 +46,12 @@ class ExportCsvTest(unittest.TestCase):
                 self.assertEqual(rows[1][12], '갱신')
                 self.assertEqual(rows[1][13], '')
 
+    def test_cost_is_rounded_to_two_decimal_places(self):
+        for value, expected in [(2.0400000003, '2.04'), (1, '1.00')]:
+            with patch.object(cards, 'list_cards', return_value=[{'cost': {'krw': value}}]):
+                content, _ = export_csv.build('42')
+            self.assertEqual(self.decode(content)[1][-1], expected)
+
     def test_empty_export_has_header_and_no_cards(self):
         with patch.object(cards, 'list_cards', return_value=[]):
             content, count = export_csv.build('123')

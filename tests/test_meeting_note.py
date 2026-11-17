@@ -130,8 +130,9 @@ class MeetingNoteTests(unittest.TestCase):
 
     def test_revoked_permission_between_probe_and_write_does_not_age(self):
         card = self.card()
-        with patch.object(apple_contacts, 'automation_status', side_effect=['authorized', 'denied']), patch.object(apple_contacts, 'set_note', side_effect=contacts.ContactSaveError('permission', kind='auth')):
+        with patch.object(apple_contacts, 'automation_status', side_effect=['authorized', 'denied']), patch.object(apple_contacts, 'set_note', side_effect=contacts.ContactSaveError('permission', kind='auth')), patch.object(self.notes, '_record', wraps=self.notes._record) as record:
             self.notes.drain()
+        record.assert_not_called()
         note = cards.load_card(card['id'])['note']
         self.assertEqual(note['state'], 'pending')
         self.assertEqual(note['attempts'], 0)
@@ -169,6 +170,79 @@ class MeetingNoteTests(unittest.TestCase):
         auth.assert_not_called()
         self.assertEqual(write.call_args.args[2], card['note']['text'])
 
+    def test_retryable_note_errors_have_bounded_retry(self):
+        for resource, kind in [('apple:test', 'not_found'), ('apple:test', 'other'),
+                               ('people/test', 'invalid'), ('people/test', 'auth')]:
+            with self.subTest(resource=resource, kind=kind):
+                card = self.card(resource)
+                backend = apple_contacts if resource.startswith('apple:') else contacts
+                with patch.object(apple_contacts, 'automation_status', return_value='authorized'), patch.object(
+                        backend, 'set_note', side_effect=contacts.ContactSaveError('fixture', kind=kind)), patch.object(
+                        self.notes.contact_backend, 'refresh_resource_name', return_value=resource), patch.object(
+                        self.notes.time, 'time', return_value=100000):
+                    self.notes.drain()
+                note = cards.load_card(card['id'])['note']
+                self.assertEqual(note['state'], 'pending')
+                self.assertEqual(note['attempts'], 1)
+                self.assertEqual(note['next_at'], 100060)
+                with patch.object(apple_contacts, 'automation_status', return_value='authorized'), patch.object(
+                        self.notes.time, 'time', return_value=186400):
+                    self.notes.drain()
+                self.assertEqual(cards.load_card(card['id'])['note']['state'], 'failed')
+
+    def test_google_note_omits_already_saved_biography_and_keeps_date(self):
+        card = {'id': '123456', 'resource_name': 'people/test', 'draft': CardDraft(
+            notes='부가 정보', warnings=['전화번호 확인']).to_dict()}
+        self.notes.enqueue(card)
+        self.assertEqual(len(card['note']['text'].splitlines()), 1)
+        card.pop('note')
+        card.update(caption='전시회', job_choice='update', job_change={'company': 'example.com', 'title': '담당'})
+        self.notes.enqueue(card)
+        text = card['note']['text']
+        self.assertIn('만남 메모: 전시회', text)
+        self.assertIn('이전 소속: example.com 담당', text)
+        self.assertNotIn('부가 정보', text)
+        self.assertNotIn('확인 필요', text)
+
+    def test_permission_wait_skips_unchanged_records_and_probes_every_15_minutes(self):
+        self.card()
+        for state in ('not_determined', 'denied'):
+            cards.save_state('notes', {})
+            with patch.object(apple_contacts, 'automation_status', return_value=state) as probe, patch.object(
+                    self.notes, '_record', wraps=self.notes._record) as record:
+                for now in (100000, 100060, 100899, 100900):
+                    with patch.object(self.notes.time, 'time', return_value=now):
+                        self.notes.drain()
+                self.assertEqual(probe.call_count, 2)
+                record.assert_not_called()
+                self.notes.drain(force_automation=True)
+                self.assertEqual(probe.call_count, 3)
+
+    def test_late_album_caption_reaches_previously_enqueued_card(self):
+        card = self.card('people/test')
+        card['media_group_id'] = 'late-album'
+        cards.save_card(card)
+        cards.group_caption(card, '전시회')
+        with patch.object(contacts, 'set_note', return_value=True) as write:
+            self.notes.drain()
+        self.assertIn('만남 메모: 전시회', write.call_args.args[2])
+        self.assertEqual(cards.load_card(card['id'])['caption'], '전시회')
+
+    def test_disabled_notes_leave_existing_queue_untouched(self):
+        card = self.card()
+        with patch.dict(os.environ, {'BIZCARD_MEETING_NOTE': 'off'}), patch.object(
+                apple_contacts, 'automation_status') as probe, patch.object(apple_contacts, 'set_note') as write:
+            self.notes.drain()
+        probe.assert_not_called()
+        write.assert_not_called()
+        self.assertEqual(cards.load_card(card['id'])['note'], card['note'])
+
+    def test_disabled_notes_are_not_enqueued(self):
+        card = {'id': '123456', 'draft': {}}
+        with patch.dict(os.environ, {'BIZCARD_MEETING_NOTE': 'off'}):
+            self.notes.enqueue(card)
+        self.assertNotIn('note', card)
+
     def test_concurrent_drain_does_not_overlap(self):
         self.card()
         entered, release = threading.Event(), threading.Event()
@@ -193,7 +267,7 @@ class MeetingNoteTests(unittest.TestCase):
             check = doctor.check_notes()
         helper.assert_not_called()
         self.assertIn('3', check.detail)
-        self.assertIn('denied', check.detail)
+        self.assertIn('거부됨', check.detail)
         self.assertEqual(self.notes.status()['last_notice_at'], 12.0)
 
     def test_request_is_explicit_and_persists_status(self):
@@ -237,6 +311,31 @@ class NoteAdapterTests(unittest.TestCase):
             result = apple_contacts.save_contact(draft, None)
         self.assertNotIn(apple_contacts.NOTE_WARNING, result.warnings)
         probe.assert_not_called()
+
+    def test_optional_status_and_verification_failures_do_not_block_save(self):
+        from bizcard_intake import meeting_note
+        draft = CardDraft(name='Example', mobile=['010-0000-0001'], notes='부가 정보')
+        with patch.object(apple_contacts, 'find_existing_candidates', return_value=(None, 0)), patch.object(
+                apple_contacts, 'create_contact', return_value={'resourceName': 'apple:test'}), patch.object(
+                apple_contacts, 'verify_contact', side_effect=RuntimeError('fixture')), patch.object(
+                meeting_note, 'status', side_effect=OSError('fixture')):
+            result = apple_contacts.save_contact(draft, None)
+        self.assertEqual(result.resource_name, 'apple:test')
+        self.assertNotIn(apple_contacts.NOTE_WARNING, result.warnings)
+
+    def test_unauthorized_save_leaves_note_guidance_to_chat_only(self):
+        from bizcard_intake import chat_ux, meeting_note
+        draft = CardDraft(name='Example', mobile=['010-0000-0001'], notes='부가 정보')
+        with patch.object(apple_contacts, 'find_existing_candidates', return_value=(None, 0)), patch.object(
+                apple_contacts, 'create_contact', return_value={'resourceName': 'apple:test'}), patch.object(
+                apple_contacts, 'verify_contact', return_value=[]), patch.object(
+                meeting_note, 'status', return_value={'automation': 'denied'}):
+            result = apple_contacts.save_contact(draft, None)
+            text = chat_ux.save_result_text({'id': '123456', 'draft': draft.to_dict(),
+                'resource_name': result.resource_name, 'note': {'state': 'pending'}},
+                {'ok': True, 'message': result.summary, 'warnings': result.warnings})
+        self.assertEqual(text.splitlines().count(apple_contacts.NOTE_WARNING), 1)
+        self.assertNotIn('참고: 참고:', text)
 
     def test_google_update_preserves_existing_biography(self):
         old = {'resourceName': 'people/test', 'biographies': [{'value': '기존 메모', 'contentType': 'TEXT_PLAIN'}]}

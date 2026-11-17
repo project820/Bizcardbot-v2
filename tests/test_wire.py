@@ -36,7 +36,7 @@ class WireTest(unittest.TestCase):
             yield self.calls
         self.stack.enter_context(patch.object(parser, 'collect', collect, create=True))
         self.metrics = self.module('metrics', record_edit=Mock(), record_calls=Mock(return_value=2.4), summary=Mock(return_value={'saved': 2, 'unedited_rate': .5, 'avg_krw': 1.0}))
-        self.note = self.module('meeting_note', enqueue=Mock(side_effect=lambda card: card.update(note={'state': 'pending', 'text': 'fixture', 'attempts': 0, 'next_at': 0})), drain=Mock(return_value={'written': 0, 'pending': 1, 'automation': 'not_determined'}), status=Mock(return_value={'automation': 'not_determined', 'pending': 1, 'last_notice_at': None}), request_automation=Mock(return_value='authorized'), _state=Mock(side_effect=lambda **fields: cards.save_state('notes', {**cards.load_state('notes'), **fields})))
+        self.note = self.module('meeting_note', enabled=Mock(return_value=True), enqueue=Mock(side_effect=lambda card: card.update(note={'state': 'pending', 'text': 'fixture', 'attempts': 0, 'next_at': 0})), drain=Mock(return_value={'written': 0, 'pending': 1, 'automation': 'not_determined'}), status=Mock(return_value={'automation': 'not_determined', 'pending': 1, 'last_notice_at': None}), request_automation=Mock(return_value='authorized'), _state=Mock(side_effect=lambda **fields: cards.save_state('notes', {**cards.load_state('notes'), **fields})))
         self.export = self.module('export_csv', build=Mock(return_value=(b'csv', 2)))
 
     def module(self, name, **attrs):
@@ -88,7 +88,7 @@ class WireTest(unittest.TestCase):
             pipeline.recognize_front(card)
         self.assertEqual(self.metrics.record_calls.call_count, 2)
         self.assertEqual(self.metrics.record_calls.call_args.args[1], self.calls)
-        self.assertIn('참고: 이 사진의 AI 비용 2.4원(기준 2원 초과)', pipeline.draft_text(card))
+        self.assertIn('참고: 이 사진의 AI 비용 2.40원(기준 2원 초과)', pipeline.draft_text(card, show_cost=True))
         self.assertEqual(self.metrics.record_edit.call_args.args[3], 'rerecognized')
 
     def test_unknown_cost_clears_prior_warning(self):
@@ -98,7 +98,7 @@ class WireTest(unittest.TestCase):
         self.metrics.record_calls.return_value = None
         with patch.object(pipeline, 'scan_front', return_value={'images': {}, 'rectifier': 'fixture', 'draft': pipeline.current_draft(card)}):
             pipeline.recognize_front(card, self.tmp / 'front.jpg')
-        self.assertNotIn('AI 비용', pipeline.draft_text(card))
+        self.assertNotIn('AI 비용', pipeline.draft_text(card, show_cost=True))
 
     def test_ai_edit_collects_calls_and_records_edit(self):
         card = self.card()
@@ -119,6 +119,106 @@ class WireTest(unittest.TestCase):
         with patch.object(telegram, 'submit'), patch.object(telegram, '_remember_card_message'):
             telegram.handle_photo('token', 42, {'caption': '전시회'}, [], self.tmp)
         self.assertEqual(cards.list_cards(42)[0].get('caption'), '전시회')
+
+    def test_back_caption_never_reenters_lock_or_spreads_to_album(self):
+        for front, back, expected in [('앞면', '', '앞면'), ('', '뒷면', '뒷면'), ('앞면', '뒷면', '앞면')]:
+            with self.subTest(front=front, back=back):
+                card = self.card()
+                card.update(awaiting_back=True, caption=front, media_group_id='back-album')
+                cards.save_card(card)
+                peer = self.card()
+                peer['media_group_id'] = 'back-album'
+                cards.save_card(peer)
+                errors = []
+                def receive():
+                    try:
+                        telegram.handle_photo('token', 42, {'caption': back}, [], self.tmp)
+                    except Exception as exc:
+                        errors.append(exc)
+                with patch.object(telegram, 'submit'):
+                    worker = threading.Thread(target=receive, daemon=True)
+                    worker.start()
+                    worker.join(3)
+                    self.assertFalse(worker.is_alive(), 'back photo deadlocked')
+                self.assertEqual(errors, [])
+                self.assertEqual(cards.load_card(card['id'])['caption'], expected)
+                self.assertFalse(cards.load_card(peer['id']).get('caption'))
+
+    def test_album_caption_does_not_wait_for_saving_member(self):
+        card = self.card()
+        card.update(media_group_id='busy-album', status='saving')
+        cards.save_card(card)
+        with pipeline.card_lock(card['id']), patch.object(telegram, 'submit'), patch.object(telegram, '_ensure_group_progress'):
+            worker = threading.Thread(target=lambda: telegram.handle_photo(
+                'token', 42, {'media_group_id': 'busy-album', 'caption': '전시회'}, [], self.tmp), daemon=True)
+            worker.start()
+            worker.join(3)
+            blocked = worker.is_alive()
+        worker.join(3)
+        self.assertFalse(blocked, 'polling waited for saving card')
+        # Real enqueue reads durable album state after the writer releases its lock.
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('bizcard_intake.review_notes', Path('bizcard_intake/meeting_note.py'))
+        notes = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(notes)
+        saved = cards.load_card(card['id'])
+        saved.update(resource_name='people/fixture', status='saved')
+        notes.enqueue(saved)
+        self.assertIn('만남 메모: 전시회', saved['note']['text'])
+
+    def test_ai_edit_keeps_photo_cost(self):
+        card = self.card()
+        card['recognition_cost_krw'] = 2.04
+        cards.save_card(card)
+        with patch.object(pipeline, 'revise_draft', return_value=CardDraft(name='Revised')):
+            pipeline.edit(card, '다시 읽어 주세요')
+        self.assertEqual(cards.load_card(card['id'])['recognition_cost_krw'], 2.04)
+
+    def test_cost_notice_is_only_in_first_draft_after_recognition(self):
+        card = self.card()
+        self.metrics.record_calls.return_value = 2.04
+        with patch.object(pipeline, 'scan_front', return_value={'images': {}, 'rectifier': 'fixture', 'draft': pipeline.current_draft(card)}):
+            pipeline.recognize_front(card, self.tmp / 'front.jpg')
+        with patch.object(telegram, '_complete_job_change'):
+            telegram.show_draft('token', 42, card)
+            self.assertIn('AI 비용 2.04원', self.send.call_args.args[2])
+            telegram.show_draft('token', 42, card)
+            self.assertNotIn('AI 비용', self.send.call_args.args[2])
+
+    def test_unresolved_permission_offers_request_and_check(self):
+        for state in ('timeout', 'not_determined'):
+            telegram._note_permission_result('token', 42, state)
+            row = self.send.call_args.kwargs['reply_markup']['inline_keyboard'][0]
+            self.assertEqual([b['callback_data'] for b in row], ['nc', 'na'])
+
+    def test_disabled_notes_do_not_offer_permission_or_pending_notices(self):
+        self.note.enabled.return_value = False
+        card = self.card()
+        card.update(status='saved', resource_name='apple:fixture', note={'state': 'pending'})
+        cards.save_card(card)
+        telegram.maybe_note_notice('token', 42)
+        telegram.schedule_note_drain('token')
+        telegram.handle_callback('token', {'data': 'na'}, 42)
+        telegram.handle_callback('token', {'data': 'nc'}, 42)
+        self.send.assert_not_called()
+        self.note.drain.assert_not_called()
+        self.note.request_automation.assert_not_called()
+        self.assertNotIn('Mac 권한', chat_ux.save_result_text(card, {'ok': True, 'message': 'Fixture'}))
+
+    def test_queued_album_caption_is_persisted_with_save(self):
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('bizcard_intake.review_notes', Path('bizcard_intake/meeting_note.py'))
+        notes = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(notes)
+        self.note.enqueue.side_effect = notes.enqueue
+        card = self.card()
+        card['media_group_id'] = 'saving-caption'
+        cards.save_card(card)
+        cards.group_caption(card, '전시회')
+        self.assertTrue(self.save(card)['ok'])
+        saved = cards.load_card(card['id'])
+        self.assertEqual(saved['caption'], '전시회')
+        self.assertIn('만남 메모: 전시회', saved['note']['text'])
 
     def test_export_command_and_button_route_without_card_lookup(self):
         with patch.object(telegram, 'send_export', create=True) as export:
@@ -244,9 +344,9 @@ class WireTest(unittest.TestCase):
         card = self.card()
         card.update(cost={'krw': 100, 'calls': 10}, recognition_cost_krw=2.4)
         with patch.dict(os.environ, {'BIZCARD_COST_WARN_KRW': '3'}):
-            self.assertNotIn('AI 비용', pipeline.draft_text(card))
+            self.assertNotIn('AI 비용', pipeline.draft_text(card, show_cost=True))
         with patch.dict(os.environ, {'BIZCARD_COST_WARN_KRW': 'invalid'}):
-            self.assertIn('기준 2원 초과', pipeline.draft_text(card))
+            self.assertIn('기준 2원 초과', pipeline.draft_text(card, show_cost=True))
 
     def test_check_permission_uses_fresh_drain_status(self):
         self.note.status.return_value['automation'] = 'denied'
@@ -292,7 +392,7 @@ class WireTest(unittest.TestCase):
         card = self.card()
         persist = pipeline._persist_save_fields
         def fail_note(card, *fields, **kwargs):
-            if fields == ('note',):
+            if fields == ('note', 'caption'):
                 raise OSError('fixture')
             return persist(card, *fields, **kwargs)
         with patch.object(pipeline, '_persist_save_fields', side_effect=fail_note):

@@ -94,8 +94,10 @@ def check_apple() -> Check:
 def check_notes() -> Check:
     from . import meeting_note
     saved = meeting_note.status()
+    label = {"authorized": "허용됨", "not_determined": "아직 묻지 않음", "denied": "거부됨"}.get(
+        saved["automation"], "확인 안 됨")
     return Check("notes", True,
-                 f"봇 기록: 메모 권한 {saved['automation']}, 대기 {saved['pending']}건")
+                 f"봇 기록: 메모 권한 {label}, 대기 {saved['pending']}건")
 
 
 def check_parser() -> Check:

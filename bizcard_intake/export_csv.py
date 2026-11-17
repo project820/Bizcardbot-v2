@@ -47,6 +47,6 @@ def build(chat_id) -> tuple[bytes, int]:
             values.append(" / ".join(str(item) for item in value) if isinstance(value, list) else str(value))
         values += [draft.get("notes") or "", card.get("caption") or "",
                    {"created": "신규", "updated": "갱신"}.get(card.get("save_action"), ""),
-                   str(cost) if _known_cost(cost) else ""]
+                   f"{cost:.2f}" if _known_cost(cost) else ""]
         writer.writerow([_safe(value) for value in values])
     return output.getvalue().encode("utf-8-sig"), len(saved)

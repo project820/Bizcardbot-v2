@@ -126,6 +126,11 @@ class ReviewTest(unittest.TestCase):
         listed.assert_called_once_with(123, ['saved'])
         self.assertEqual(result, {'saved': 3, 'unedited_rate': .5, 'avg_krw': 2.0})
 
+    def test_two_sided_card_counts_as_unedited_but_rerecognition_does_not(self):
+        saved = [{'review': {'back_added': True}}, {'review': {'rerecognized': True}}]
+        with patch.object(cards, 'list_cards', return_value=saved):
+            self.assertEqual(metrics.summary('42')['unedited_rate'], .5)
+
     def test_summary_empty_and_legacy_cards_have_unknown_rates(self):
         for saved in ([], [{}]):
             with patch.object(cards, 'list_cards', return_value=saved):

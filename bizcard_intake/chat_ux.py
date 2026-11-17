@@ -62,7 +62,7 @@ def save_result_text(card: dict, outcome: dict, retried: bool = False) -> str:
         if card.get("note") and (card.get("resource_name") or "").startswith("apple:"):
             try:
                 from . import meeting_note
-                if meeting_note.status().get("automation") != "authorized":
+                if meeting_note.enabled() and meeting_note.status().get("automation") != "authorized":
                     lines.append("참고: 메모는 Mac 권한을 허용하면 자동으로 추가합니다.")
             except Exception:
                 pass

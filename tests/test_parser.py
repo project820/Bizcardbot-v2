@@ -70,6 +70,14 @@ class ParserTest(unittest.TestCase):
         with patch.object(parser, "run_backend", lambda prompt, image_path=None: {"name": "홍길동", "work": ["052-555-0126", "052-555-0127"]}):
             self.assertEqual(parser.revise_draft(draft, "두 회선").work, ["052-555-0126", "052-555-0127"])
 
+    def test_optional_cost_and_agreement_failure_preserves_recognition(self):
+        with parser.collect() as calls, patch.object(parser, 'cost_krw', side_effect=RuntimeError('fixture')):
+            parser._record_call('openai', 'fixture', {})
+        with parser.collect() as calls, patch.object(parser, '_field_agreement', side_effect=RuntimeError('fixture')):
+            calls.append({'krw': None})
+            merged = parser.crosscheck_merge({'name': 'Example'}, {'name': 'Example'}, '')
+        self.assertEqual(merged['name'], 'Example')
+
     def test_extract_json(self):
         self.assertEqual(parser.extract_json('noise {"a": 1} tail'), {"a": 1})
         self.assertIsNone(parser.extract_json("no json"))

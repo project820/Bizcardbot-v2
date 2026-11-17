@@ -429,7 +429,10 @@ class SaveOperationTests(unittest.TestCase):
                     def helper(command, **payload):
                         if command == stage:
                             before = cards.load_card(card['id'])
-                            telegram.handle_callback('synthetic', {'data': f"{action}:{card['id']}"}, 42)
+                            # Polling and the save worker run on separate threads.
+                            with ThreadPoolExecutor(max_workers=1) as taps:
+                                taps.submit(telegram.handle_callback, 'synthetic',
+                                            {'data': f"{action}:{card['id']}"}, 42).result(timeout=3)
                             self.assertEqual(cards.load_card(card['id']), before)
                         if command in ('find', 'find-fingerprint'):
                             return {'identifiers': []}
@@ -561,7 +564,8 @@ class SaveOperationTests(unittest.TestCase):
             telegram.confirm_card('synthetic', 42, card, 'again', 'nonce')
         text = send.call_args.args[2]
         self.assertIn('연락처 사진은 올리지 못해', text)
-        self.assertIn(apple.NOTE_WARNING, text)
+        self.assertEqual(text.splitlines().count(apple.NOTE_WARNING), 1)
+        self.assertNotIn("참고: 참고:", text)
         self.assertIn('전화번호 누락', text)
         self.assertEqual(cards.load_card(card['id'])['photo_status'], 'failed')
         self.assertTrue(photo.exists())

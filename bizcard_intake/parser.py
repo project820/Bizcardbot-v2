@@ -79,10 +79,13 @@ def _safe_usage(usage: dict) -> dict:
 
 
 def _record_call(provider: str, model: str, usage: dict) -> None:
-    calls = _calls.get()
-    if calls is not None:
-        calls.append({"provider": provider, "model": model, "usage": _safe_usage(usage),
-                      "krw": cost_krw(provider, model, usage)})
+    try:
+        calls = _calls.get()
+        if calls is not None:
+            calls.append({"provider": provider, "model": model, "usage": _safe_usage(usage),
+                          "krw": cost_krw(provider, model, usage)})
+    except Exception:
+        log.warning("AI cost collection failed")
 
 
 FIELD_GUIDE = (
@@ -397,9 +400,12 @@ def crosscheck_merge(luna: dict, haiku: dict, ocr_text: str) -> dict:
                 if b_in and len(b) >= len(a):
                     merged["address"] = b
                 warnings.append(f"주소 판독이 엇갈림: {' / '.join(a)} / {' / '.join(b)}")
-    calls = _calls.get()
-    if calls:
-        calls[-1]["agree"] = _field_agreement(luna, haiku)
+    try:
+        calls = _calls.get()
+        if calls:
+            calls[-1]["agree"] = _field_agreement(luna, haiku)
+    except Exception:
+        log.warning("AI agreement collection failed")
     merged["warnings"] = warnings
     return merged
 

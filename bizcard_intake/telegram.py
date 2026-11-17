@@ -92,9 +92,11 @@ def send_export(token: str, chat_id: int) -> None:
         send_message(token, chat_id, "CSV 내보내기에 실패했습니다. 잠시 후 다시 눌러주세요.", reply_markup=export_buttons())
 
 
-def _note_buttons(*, check: bool = False) -> dict:
-    return {"inline_keyboard": [[{"text": "다시 확인" if check else "메모 권한 요청",
-                                  "callback_data": "nc" if check else "na"}]]}
+def _note_buttons(*, check: bool = False, request: bool = False) -> dict:
+    row = [{"text": "다시 확인" if check else "메모 권한 요청", "callback_data": "nc" if check else "na"}]
+    if check and request:
+        row.append({"text": "메모 권한 요청", "callback_data": "na"})
+    return {"inline_keyboard": [row]}
 
 
 def _pending_notes(chat_id: int) -> int:
@@ -109,6 +111,8 @@ def maybe_note_notice(token: str, chat_id: int) -> None:
         return
     try:
         from . import meeting_note
+        if not meeting_note.enabled():
+            return
         pending = _pending_notes(chat_id)
         if not pending or meeting_note.status().get("automation") == "authorized":
             return
@@ -139,8 +143,8 @@ def _note_permission_result(token: str, chat_id: int, automation: str, pending: 
         send_message(token, chat_id, "시스템 설정 > 개인정보 보호 및 보안 > 자동화에서 Python 아래 '연락처'를 켜세요.",
                      reply_markup=_note_buttons(check=True))
     else:
-        send_message(token, chat_id, "메모 권한을 확인하지 못했습니다. Mac mini 화면을 확인한 뒤 다시 확인을 누르세요.",
-                     reply_markup=_note_buttons(check=True))
+        send_message(token, chat_id, "메모 권한을 확인하지 못했습니다. Mac mini 화면을 확인한 뒤 권한을 요청하거나 다시 확인하세요.",
+                     reply_markup=_note_buttons(check=True, request=True))
 
 
 def schedule_note_drain(token: str, check_chat_id: Optional[int] = None) -> None:
@@ -154,8 +158,10 @@ def schedule_note_drain(token: str, check_chat_id: Optional[int] = None) -> None
     def drain() -> None:
         try:
             from . import meeting_note
+            if not meeting_note.enabled():
+                return
             pending = _pending_notes(check_chat_id) if check_chat_id is not None else None
-            result = meeting_note.drain()
+            result = meeting_note.drain(force_automation=True) if check_chat_id is not None else meeting_note.drain()
             if check_chat_id is not None:
                 _note_permission_result(token, check_chat_id, result.get("automation", "error"), pending)
             for chat_id in allowed_chat_ids():
@@ -194,6 +200,9 @@ def _failed_note_notice(token: str, chat_id: int) -> None:
 
 def request_note_permission(token: str, chat_id: int) -> None:
     """Only an explicit na button may open the Mac automation prompt."""
+    from . import meeting_note
+    if not meeting_note.enabled():
+        return
     if not _automation_lock.acquire(blocking=False):
         send_message(token, chat_id, "메모 권한을 확인 중입니다. 잠시 후 다시 확인하세요.",
                      reply_markup=_note_buttons(check=True))
@@ -222,14 +231,20 @@ def request_note_permission(token: str, chat_id: int) -> None:
 def _capture_caption(card: dict, caption: str) -> None:
     group = card.get("media_group_id")
     members = cards.group_cards(card["chat_id"], group) if group else [card]
-    shared = next((c.get("caption") for c in members if c.get("caption")), "") or caption.strip()[:300]
+    shared = cards.group_caption(card, caption) if group else caption.strip()[:300]
     if not shared:
         return
     for member in members:
-        with pipeline.card_lock(member["id"]):
+        with pipeline.card_lock(member["id"], blocking=False) as acquired:
+            if not acquired:
+                continue  # enqueue/drain reads the durable album caption later.
             fresh = cards.load_card(member["id"])
             if fresh and not fresh.get("caption"):
                 fresh["caption"] = shared
+                note = fresh.get("note") or {}
+                if note.get("state") == "pending":
+                    from . import meeting_note
+                    note["text"] = meeting_note.compose(fresh, pipeline.current_draft(fresh), shared)
                 cards.save_card(fresh)
             if fresh and member["id"] == card["id"]:
                 card.clear()
@@ -708,7 +723,9 @@ def handle_photo(token: str, chat_id: int, message: dict, photos: list, data_dir
             if not fresh.get("awaiting_back"):
                 send_message(token, chat_id, "뒷면 사진을 이미 받았습니다. 최근 초안을 확인하세요.")
                 return None
-            _capture_caption(fresh, str(message.get("caption") or ""))
+            if not fresh.get("caption"):
+                fresh["caption"] = (cards.group_caption(fresh)
+                                    or str(message.get("caption") or "").strip()[:300])
             fresh["awaiting_back"] = False
             cards.save_card(fresh)
         submit(process_back_photo, token, chat_id, photos, data_dir, fresh)
@@ -800,6 +817,8 @@ def show_draft(token: str, chat_id: int, card: dict, replace_message_id: Optiona
         fresh = cards.load_card(card["id"])
         if not fresh or fresh.get("status") != "review" or pipeline.unresolved_save(fresh):
             return
+        show_cost = bool(fresh.get("recognition_cost_notice_pending"))
+        fresh["recognition_cost_notice_pending"] = False
         fresh.pop("job_choice", None)
         fresh["job_change_pending"] = True
         fresh["job_change_started_at"] = time.time()
@@ -807,7 +826,7 @@ def show_draft(token: str, chat_id: int, card: dict, replace_message_id: Optiona
         cards.save_card(fresh)
         card.clear()
         card.update(fresh)
-    text = (prefix + "\n\n" if prefix else "") + pipeline.draft_text(card) + "\n\n고칠 내용은 이 메시지에 답장으로 보내주세요."
+    text = (prefix + "\n\n" if prefix else "") + pipeline.draft_text(card, show_cost=show_cost) + "\n\n고칠 내용은 이 메시지에 답장으로 보내주세요."
     text += "\n\n기존 연락처를 확인 중입니다. 확인 후 저장 버튼이 표시됩니다."
     message_id = None
     is_caption = False
@@ -832,11 +851,11 @@ def show_draft(token: str, chat_id: int, card: dict, replace_message_id: Optiona
     # Deliver the draft first. Optional contact lookup never adds to first-draft latency.
     # show_draft is called by photo/edit workers, never by the update loop.
     # Finish on that same worker so shutdown waits for the lookup as well.
-    _complete_job_change(token, chat_id, dict(card), message_id, prefix, is_caption)
+    _complete_job_change(token, chat_id, dict(card), message_id, prefix, is_caption, show_cost=show_cost)
 
 
 def _complete_job_change(token: str, chat_id: int, candidate: dict, message_id: int,
-                         prefix: str, is_caption: bool) -> None:
+                         prefix: str, is_caption: bool, *, show_cost: bool = False) -> None:
     pipeline.refresh_job_change(candidate)
     deadline = time.monotonic() + LOOKUP_APPLY_WAIT_SECONDS
     delay = .05
@@ -854,7 +873,7 @@ def _complete_job_change(token: str, chat_id: int, candidate: dict, message_id: 
         delay = min(delay * 2, .5)
     if fresh is None:
         return
-    text = (prefix + "\n\n" if prefix else "") + pipeline.draft_text(fresh) + "\n\n고칠 내용은 이 메시지에 답장으로 보내주세요."
+    text = (prefix + "\n\n" if prefix else "") + pipeline.draft_text(fresh, show_cost=show_cost) + "\n\n고칠 내용은 이 메시지에 답장으로 보내주세요."
     try:
         if is_caption and len(text) <= CAPTION_LIMIT:
             api_post(token, "editMessageCaption", {"chat_id": chat_id, "message_id": message_id,

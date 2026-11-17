@@ -34,6 +34,7 @@ OPEN_STATUSES = ("processing", "review", "saving", "save_failed", "needs_confirm
 REVIEW_STATUSES = ("review", "save_failed")
 _seq_lock = threading.Lock()
 followup_lock = threading.RLock()
+_caption_lock = threading.Lock()
 _write_locks_guard = threading.Lock()
 _write_locks: dict[str, threading.RLock] = defaultdict(threading.RLock)
 _pending_message_lock = threading.Lock()
@@ -238,6 +239,20 @@ def load_state(name: str) -> dict:
 def save_state(name: str, data: dict) -> None:
     CARD_DIR.mkdir(parents=True, exist_ok=True)
     _atomic_write(CARD_DIR / f"_{name}.state", json.dumps(data, ensure_ascii=False, indent=2))
+
+
+def group_caption(card: dict, caption: str = "") -> str:
+    """Keep album captions durable without acquiring another card's lock."""
+    group = card.get("media_group_id")
+    if not group:
+        return ""
+    key = str(card["chat_id"]) + ":" + str(group)
+    with _caption_lock:
+        saved = load_state("album_captions")
+        if not saved.get(key) and caption.strip():
+            saved[key] = caption.strip()[:300]
+            save_state("album_captions", saved)
+        return saved.get(key, "")
 
 
 def initialize_followup() -> dict:

@@ -188,7 +188,7 @@ def unresolved_save(card: dict) -> bool:
 
 
 @contextmanager
-def _collect_cost(card: dict):
+def _collect_cost(card: dict, *, recognition: bool = True):
     """Keep optional accounting failures outside the recognition/save path."""
     from . import parser
     collector = getattr(parser, "collect", None)
@@ -199,10 +199,12 @@ def _collect_cost(card: dict):
             try:
                 from . import metrics
                 cost = metrics.record_calls(card, calls)
-                card["recognition_cost_krw"] = cost
-                threshold = _cost_warn_threshold()
-                if cost is not None and cost > threshold:
-                    log.warning("AI recognition cost %.1f KRW exceeds %.1f KRW", cost, threshold)
+                if recognition:
+                    card["recognition_cost_krw"] = cost
+                    threshold = _cost_warn_threshold()
+                    card["recognition_cost_notice_pending"] = cost is not None and cost > threshold
+                    if card["recognition_cost_notice_pending"]:
+                        log.warning("AI recognition cost %.2f KRW exceeds %.2f KRW", cost, threshold)
             except ImportError:
                 pass  # parallel accounting module is not present before integration
             except Exception:
@@ -354,7 +356,7 @@ def _recognize(card: dict, side: str, work, *args) -> dict:
                     fields = ("images", "rectifier", "draft", "front_draft", "back_draft",
                               "recognition_error", "revision", "awaiting_back", "job_change",
                               "job_choice", "job_change_lookup_key", "job_change_pending",
-                              "cost", "review", "recognition_cost_krw")
+                              "cost", "review", "recognition_cost_krw", "recognition_cost_notice_pending")
                     if completed:
                         for key in fields:
                             if key in snapshot:
@@ -469,7 +471,7 @@ def _edit_locked(card: dict, text: str) -> tuple[bool, str]:
         note = f"\n반영하지 못한 줄: {' / '.join(unknown[:3])}" if unknown else ""
         return True, "직접 수정 반영" + note
     try:
-        with _collect_cost(card):
+        with _collect_cost(card, recognition=False):
             revised = revise_draft(previous, text)
     finally:
         cards.save_card(card)
@@ -642,7 +644,7 @@ def _save(card: dict, *, new_operation: bool = False) -> dict:
     try:
         from . import meeting_note
         meeting_note.enqueue(card)
-        _persist_save_fields(card, "note")
+        _persist_save_fields(card, "note", "caption")
     except Exception:
         log.warning("meeting note enqueue failed; contact remains saved")
     # A crash during cleanup must leave a durable terminal state, never saving.
@@ -888,14 +890,14 @@ def cleanup_paths(*items) -> None:
                 pass
 
 
-def draft_text(card: dict) -> str:
+def draft_text(card: dict, *, show_cost: bool = False) -> str:
     draft = current_draft(card)
     header = f"{cards.label(card)} 명함 초안"
     text = draft.to_text(header=header)
     cost = card.get("recognition_cost_krw")
     threshold = _cost_warn_threshold()
-    if cost is not None and cost > threshold:
-        text += f"\n참고: 이 사진의 AI 비용 {cost:.1f}원(기준 {threshold:g}원 초과)"
+    if show_cost and cost is not None and cost > threshold:
+        text += f"\n참고: 이 사진의 AI 비용 {cost:.2f}원(기준 {threshold:g}원 초과)"
     old = card.get("job_change")
     if old:
         text += f"\n기존 연락처: {old['company']} {old['title']} → 새 명함: {draft.company} {draft.title}"

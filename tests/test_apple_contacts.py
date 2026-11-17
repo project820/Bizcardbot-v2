@@ -72,7 +72,7 @@ class AppleTests(unittest.TestCase):
         self.assertIn("중복 후보 2건", result.warnings[0])
         self.assertEqual(events, ["checkpoint", "photo"])
 
-    def test_existing_identifier_does_not_create_and_notes_warn(self):
+    def test_existing_identifier_does_not_create_or_duplicate_note_guidance(self):
         apple = self.apple()
         with patch.object(apple, "get_contact", return_value={"resourceName": "apple:id"}), patch.object(
             apple, "update_contact"
@@ -82,7 +82,7 @@ class AppleTests(unittest.TestCase):
             result = apple.save_contact(draft(notes="보존해야 할 메모"), None, resource_name="apple:id")
         update.assert_called_once()
         create.assert_not_called()
-        self.assertTrue(any("메모" in warning for warning in result.warnings))
+        self.assertNotIn(apple.NOTE_WARNING, result.warnings)
 
     def test_helper_errors_and_timeout_are_safe(self):
         apple = self.apple()

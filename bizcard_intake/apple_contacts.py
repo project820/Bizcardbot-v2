@@ -458,13 +458,13 @@ def save_contact(draft: CardDraft, profile_image_path: str | None, resource_name
             checkpoint(saved_name, action)
         except Exception:
             warnings.append("저장 기록 실패: 연락처 앱에서 저장 여부를 확인하세요.")
-    from . import meeting_note
-    if contacts._biography(draft) and meeting_note.status()["automation"] != "authorized":
-        warnings.append(NOTE_WARNING)
     result = SaveResult(action, saved_name, warnings=warnings, display_name=draft.display_name)
     if operation:
         _attach_photo(result, profile_image_path, draft, checkpoint, operation)
     else:
         _attach_photo(result, profile_image_path, draft, checkpoint)
-    result.warnings.extend(verify_contact(result.resource_name, draft))
+    try:
+        result.warnings.extend(verify_contact(result.resource_name, draft))
+    except Exception:
+        result.warnings.append("저장 확인을 마치지 못했습니다. 연락처는 저장되어 있습니다.")
     return result

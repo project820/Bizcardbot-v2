@@ -112,7 +112,7 @@ def summary(chat_id) -> dict:
     reviews = [card["review"] for card in saved if isinstance(card.get("review"), dict)]
     unedited = sum(not review.get("edited") and not review.get("ai_edits")
                    and not review.get("manual_edits") and not review.get("rerecognized")
-                   and not review.get("back_added") for review in reviews)
+                   for review in reviews)
     costs = [(card.get("cost") or {}).get("krw") for card in saved]
     known = [cost for cost in costs if _known_cost(cost)]
     return {"saved": len(saved), "unedited_rate": unedited / len(reviews) if reviews else None,
