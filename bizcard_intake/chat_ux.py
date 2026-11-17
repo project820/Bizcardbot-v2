@@ -19,6 +19,8 @@ HELP_TEXT = (
     "  (이름, 직함, 직함원문, 회사, 휴대전화, 회사전화, 팩스, 이메일, 웹사이트, 주소, 메모. 비우려면 '팩스: -')\n"
     "- 문장으로 써도 됩니다. 예) 이메일은 kim@acme.com 이야\n"
     "- '목록': 저장 안 된 명함과 일괄 저장 버튼\n"
+    "- 사진 캡션: 만남 메모로 추가\n"
+    "- CSV 내보내기 버튼 또는 /export: 저장한 명함 파일\n"
     "- /alerts 또는 '알림 설정': 후속 알림 켜기·끄기"
 )
 
@@ -57,6 +59,13 @@ def save_result_text(card: dict, outcome: dict, retried: bool = False) -> str:
         for warning in outcome.get("warnings") or []:
             if "사진" not in warning:
                 lines.append(f"참고: {warning}")
+        if card.get("note") and (card.get("resource_name") or "").startswith("apple:"):
+            try:
+                from . import meeting_note
+                if meeting_note.status().get("automation") != "authorized":
+                    lines.append("참고: 메모는 Mac 권한을 허용하면 자동으로 추가합니다.")
+            except Exception:
+                pass
         return "\n".join(lines)
     if outcome.get("needs_confirmation"):
         return f"{cards.label(card)} 저장 확인 필요: {name}\n{outcome['message']}"

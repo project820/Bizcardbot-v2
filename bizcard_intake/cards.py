@@ -58,6 +58,7 @@ def new_card(chat_id, *, media_group_id: Optional[str] = None, source: str = "te
         "created_at": now(),
         "updated_at": now(),
         "media_group_id": media_group_id,
+        "caption": "",
         "images": {},
         "draft": {},
         "front_draft": None,

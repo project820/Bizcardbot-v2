@@ -16,7 +16,7 @@ import threading
 import tempfile
 import time
 from collections import defaultdict
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from functools import wraps
 from pathlib import Path
 from typing import Callable, Optional
@@ -187,9 +187,50 @@ def unresolved_save(card: dict) -> bool:
     return bool(card.get("save_intent")) and card.get("status") not in ("saved", "cancelled")
 
 
+@contextmanager
+def _collect_cost(card: dict):
+    """Keep optional accounting failures outside the recognition/save path."""
+    from . import parser
+    collector = getattr(parser, "collect", None)
+    with collector() if collector else nullcontext([]) as calls:
+        try:
+            yield
+        finally:
+            try:
+                from . import metrics
+                cost = metrics.record_calls(card, calls)
+                card["recognition_cost_krw"] = cost
+                threshold = _cost_warn_threshold()
+                if cost is not None and cost > threshold:
+                    log.warning("AI recognition cost %.1f KRW exceeds %.1f KRW", cost, threshold)
+            except ImportError:
+                pass  # parallel accounting module is not present before integration
+            except Exception:
+                log.warning("AI cost recording failed")
+
+
+def _cost_warn_threshold() -> float:
+    import math
+    try:
+        value = float(_os.environ.get("BIZCARD_COST_WARN_KRW", "2"))
+        return value if math.isfinite(value) and value >= 0 else 2.0
+    except ValueError:
+        return 2.0
+
+
 def set_draft(card: dict, draft: CardDraft, event: str) -> None:
     if unresolved_save(card):
         raise ContactSaveError("이전 저장 결과를 먼저 확인하세요. 확인 전에는 초안을 수정할 수 없습니다.", kind="invalid")
+    try:
+        from . import metrics
+        review_event = {"back_merged": "back_added"}.get(event, event)
+        if event == "recognized" and card.get("revision", 0) > 0:
+            review_event = "rerecognized"
+        metrics.record_edit(card, current_draft(card), draft, review_event)
+    except ImportError:
+        pass
+    except Exception:
+        log.warning("review recording failed")
     card["draft"] = draft.to_dict()
     card.pop("job_change_lookup_key", None)
     card.pop("job_choice", None)
@@ -296,7 +337,8 @@ def _recognize(card: dict, side: str, work, *args) -> dict:
     completed = False
     try:
         # OCR, parsing, merging and image preparation run without a card lock.
-        work(snapshot, *args)
+        with _collect_cost(snapshot):
+            work(snapshot, *args)
         completed = True
     finally:
         with card_lock(card["id"]):
@@ -311,7 +353,8 @@ def _recognize(card: dict, side: str, work, *args) -> dict:
                     # Preserve message/reminder metadata written during OCR.
                     fields = ("images", "rectifier", "draft", "front_draft", "back_draft",
                               "recognition_error", "revision", "awaiting_back", "job_change",
-                              "job_choice", "job_change_lookup_key", "job_change_pending")
+                              "job_choice", "job_change_lookup_key", "job_change_pending",
+                              "cost", "review", "recognition_cost_krw")
                     if completed:
                         for key in fields:
                             if key in snapshot:
@@ -425,7 +468,11 @@ def _edit_locked(card: dict, text: str) -> tuple[bool, str]:
         cards.save_card(card)
         note = f"\n반영하지 못한 줄: {' / '.join(unknown[:3])}" if unknown else ""
         return True, "직접 수정 반영" + note
-    revised = revise_draft(previous, text)
+    try:
+        with _collect_cost(card):
+            revised = revise_draft(previous, text)
+    finally:
+        cards.save_card(card)
     if revised is None:
         return False, "자동 수정 실패: '이름: 홍길동'처럼 '항목: 값' 형식으로 보내주시면 바로 반영됩니다."
     set_draft(card, preserve_locked(revised, previous), "ai_edit")
@@ -592,6 +639,12 @@ def _save(card: dict, *, new_operation: bool = False) -> dict:
                          "last_error", "error_kind", "next_retry_at", "save_warnings",
                          "followup_saved_at", "followup_state", "followup_due_at", "followup_nonce",
                          event="saved", detail=result.summary)
+    try:
+        from . import meeting_note
+        meeting_note.enqueue(card)
+        _persist_save_fields(card, "note")
+    except Exception:
+        log.warning("meeting note enqueue failed; contact remains saved")
     # A crash during cleanup must leave a durable terminal state, never saving.
     keep = {"profile"} if result.photo == "failed" else set()
     cleanup_card_images(card, keep=keep)
@@ -839,6 +892,10 @@ def draft_text(card: dict) -> str:
     draft = current_draft(card)
     header = f"{cards.label(card)} 명함 초안"
     text = draft.to_text(header=header)
+    cost = card.get("recognition_cost_krw")
+    threshold = _cost_warn_threshold()
+    if cost is not None and cost > threshold:
+        text += f"\n참고: 이 사진의 AI 비용 {cost:.1f}원(기준 {threshold:g}원 초과)"
     old = card.get("job_change")
     if old:
         text += f"\n기존 연락처: {old['company']} {old['title']} → 새 명함: {draft.company} {draft.title}"
