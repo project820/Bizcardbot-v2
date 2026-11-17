@@ -198,3 +198,32 @@ FileHandle.standardOutput.write(try JSONEncoder().encode(values.map(normalizedPh
         for value, normalized in zip(values, actual):
             with self.subTest(phone=value):
                 self.assertEqual(normalized, normalize_phone(value))
+
+
+@unittest.skipUnless(sys.platform == 'darwin' and shutil.which('swiftc'), 'macOS Swift required')
+class SwiftNoteTests(unittest.TestCase):
+    def test_handler_arguments_and_automation_error_mapping(self):
+        source = Path('scripts/apple_contacts.swift').read_text()
+        self.assertIn('func callHandler(', source)
+        prefix = source[:source.index('func execute(')]
+        program = prefix + '''
+let literal = "quote \\" and newline\\n한글; do shell script"
+let script = "on echoargs(a, b, c)\\nreturn a & b & c\\nend echoargs"
+let result = try callHandler(script, "echoargs", ["id", "[marker]", literal])
+guard result.stringValue == "id[marker]" + literal else { exit(51) }
+guard automationName(0) == "authorized" else { exit(52) }
+guard automationName(-1744) == "not_determined" else { exit(53) }
+guard automationName(-1743) == "denied" else { exit(54) }
+guard scriptErrorKind(-1728) == "not_found" else { exit(55) }
+for code in [-600, -1712] { guard scriptErrorKind(code) == "transient" else { exit(56) } }
+var error: NSDictionary?
+guard NSAppleScript(source: noteScript)?.compileAndReturnError(&error) == true else { exit(57) }
+print("PASS: event arguments, permission/error mapping, note script syntax")
+'''
+        with tempfile.TemporaryDirectory() as folder:
+            path, binary = Path(folder)/'note.swift', Path(folder)/'note'
+            path.write_text(program)
+            build = subprocess.run(['swiftc', str(path), '-o', str(binary)], capture_output=True, text=True, timeout=30)
+            self.assertEqual(build.returncode, 0, build.stderr)
+            result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)

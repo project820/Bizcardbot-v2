@@ -291,7 +291,7 @@ def cmd_setup_contacts() -> int:
             settings = {"BIZCARD_CONTACTS_BACKEND": "apple", "BIZCARD_APPLE_CONTAINER": container["id"]}
             onboarding.save_settings(path, settings)
             print(f"Mac 연락처({container['name']})를 저장했습니다.")
-            print("Mac 연락처에는 메모·검증 경고를 저장할 수 없습니다. 명함 초안에서 확인하세요.")
+            print("메모는 Mac 자동화 권한을 허용하면 저장 후 자동으로 추가합니다.")
         else:
             print("1 또는 2를 입력하세요. 설정을 저장하지 않았습니다.")
             return 1
