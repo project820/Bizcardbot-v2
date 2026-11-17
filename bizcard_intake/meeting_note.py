@@ -27,7 +27,7 @@ def enabled() -> bool:
 def compose(card: dict, draft: CardDraft, caption: str = "") -> str:
     """Build one bounded block with a stable, per-card replay marker."""
     try:
-        raw = card.get("created_at", "").replace("Z", "+00:00")
+        raw = str(card.get("created_at") or "").replace("Z", "+00:00")
         try:
             received = datetime.fromisoformat(raw)
         except ValueError:
@@ -37,7 +37,7 @@ def compose(card: dict, draft: CardDraft, caption: str = "") -> str:
         day = "날짜 미기재"
     marker = f"[명함 {day} #{str(card['id'])[-6:]}]"
     lines = [marker]
-    caption = caption or cards.group_caption(card)
+    caption = caption or card.get("caption") or cards.group_caption(card)[0]
     google = (card.get("resource_name") or "").startswith("people/")
     if caption.strip():
         lines.append("만남 메모: " + caption.strip()[:300])
@@ -58,7 +58,7 @@ def enqueue(card: dict) -> None:
     if not enabled() or card.get("note"):
         return
     if not card.get("caption"):
-        card["caption"] = cards.group_caption(card)
+        card["caption"] = cards.group_caption(card)[0]
     text = compose(card, CardDraft.from_dict(card.get("draft") or {}), card.get("caption") or "")
     card["note"] = {"state": "pending", "text": text, "attempts": 0, "next_at": None}
 
@@ -156,7 +156,7 @@ def drain(*, force_automation: bool = False) -> dict:
                 card = cards.load_card(snapshot["id"]) if acquired else None
                 if (card and card.get("status") == "saved" and not card.get("caption")
                         and (card.get("note") or {}).get("state") == "pending"):
-                    caption = cards.group_caption(card)
+                    caption = cards.group_caption(card)[0]
                     if caption:
                         card["caption"] = caption
                         card["note"]["text"] = compose(card, CardDraft.from_dict(card.get("draft") or {}), caption)
@@ -172,12 +172,11 @@ def drain(*, force_automation: bool = False) -> dict:
                 if note != card["note"]:
                     _record(card, note)
                 continue
+            # Try due work before expiring it: the retry window may have elapsed
+            # while the bot was stopped. A further failure expires in _defer.
             started = note.get("first_attempt_at")
-            if started is not None and now - started >= 86400:
-                _fail(note)
-                _record(card, note)
-                continue
-            if note.get("next_at") and note["next_at"] > now:
+            expired = started is not None and now - started >= 86400
+            if note.get("next_at") and note["next_at"] > now and not expired:
                 continue
             try:
                 if resource.startswith("apple:") and automation != "authorized":

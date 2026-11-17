@@ -82,9 +82,9 @@ def send_export(token: str, chat_id: int) -> None:
         rate = summary.get("unedited_rate")
         cost = summary.get("avg_krw")
         if rate is not None:
-            parts.append(f"수정 없이 저장 {rate:.0%}")
+            parts.append(f"수정 없이 저장 {rate:.0%}(기록 {summary.get('reviewed', 0)}건)")
         if cost is not None:
-            parts.append(f"평균 {cost:.1f}원")
+            parts.append(f"평균 {cost:.2f}원(기록 {summary.get('costed', 0)}건)")
         filename = "bizcards-" + cards.followup_localtime(time.time()).strftime("%Y%m%d") + ".csv"
         send_document(token, chat_id, content, filename, caption=" · ".join(parts))
     except Exception:
@@ -230,10 +230,10 @@ def request_note_permission(token: str, chat_id: int) -> None:
 
 def _capture_caption(card: dict, caption: str) -> None:
     group = card.get("media_group_id")
-    members = cards.group_cards(card["chat_id"], group) if group else [card]
-    shared = cards.group_caption(card, caption) if group else caption.strip()[:300]
+    shared, registered = cards.group_caption(card, caption) if group else (caption.strip()[:300], False)
     if not shared:
         return
+    members = cards.group_cards(card["chat_id"], group) if registered else [card]
     for member in members:
         with pipeline.card_lock(member["id"], blocking=False) as acquired:
             if not acquired:
@@ -724,8 +724,11 @@ def handle_photo(token: str, chat_id: int, message: dict, photos: list, data_dir
                 send_message(token, chat_id, "뒷면 사진을 이미 받았습니다. 최근 초안을 확인하세요.")
                 return None
             if not fresh.get("caption"):
-                fresh["caption"] = (cards.group_caption(fresh)
+                fresh["caption"] = (cards.group_caption(fresh)[0]
                                     or str(message.get("caption") or "").strip()[:300])
+                if fresh["caption"] and (fresh.get("note") or {}).get("state") == "pending":
+                    from . import meeting_note
+                    fresh["note"]["text"] = meeting_note.compose(fresh, pipeline.current_draft(fresh), fresh["caption"])
             fresh["awaiting_back"] = False
             cards.save_card(fresh)
         submit(process_back_photo, token, chat_id, photos, data_dir, fresh)
@@ -733,8 +736,10 @@ def handle_photo(token: str, chat_id: int, message: dict, photos: list, data_dir
     # Card creation happens here, in update order, so card numbers follow the
     # album; image prep, OCR and the model calls run on the worker pool.
     group = (chat_id, str(media_group_id)) if media_group_id else None
-    card = cards.new_card(chat_id, media_group_id=group[1] if group else None)
-    _capture_caption(card, str(message.get("caption") or ""))
+    caption = str(message.get("caption") or "")
+    # Own captions must be durable before any worker can acquire the card lock.
+    card = cards.new_card(chat_id, media_group_id=group[1] if group else None, caption=caption)
+    _capture_caption(card, caption)
     if group:
         _ensure_group_progress(token, group)
         submit(process_front_photo, token, chat_id, photos, data_dir, card, None, True, group=group)
@@ -1010,6 +1015,11 @@ def handle_callback(token: str, callback: dict, chat_id: int) -> None:
     if action in ("na", "nc", "ex"):
         if chat_id not in allowed_chat_ids():
             return
+        if action in ("na", "nc"):
+            from . import meeting_note
+            if not meeting_note.enabled():
+                send_message(token, chat_id, "메모 기능이 꺼져 있습니다(BIZCARD_MEETING_NOTE=off).")
+                return
         if action == "na":
             request_note_permission(token, chat_id)
         elif action == "nc":

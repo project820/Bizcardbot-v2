@@ -116,4 +116,5 @@ def summary(chat_id) -> dict:
     costs = [(card.get("cost") or {}).get("krw") for card in saved]
     known = [cost for cost in costs if _known_cost(cost)]
     return {"saved": len(saved), "unedited_rate": unedited / len(reviews) if reviews else None,
-            "avg_krw": sum(known) / len(known) if known else None}
+            "avg_krw": sum(known) / len(known) if known else None,
+            "reviewed": len(reviews), "costed": len(known)}

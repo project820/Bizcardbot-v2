@@ -124,7 +124,7 @@ class ReviewTest(unittest.TestCase):
         with patch.object(cards, 'list_cards', return_value=saved) as listed:
             result = metrics.summary(123)
         listed.assert_called_once_with(123, ['saved'])
-        self.assertEqual(result, {'saved': 3, 'unedited_rate': .5, 'avg_krw': 2.0})
+        self.assertEqual(result, {'saved': 3, 'unedited_rate': .5, 'avg_krw': 2.0, 'reviewed': 2, 'costed': 2})
 
     def test_two_sided_card_counts_as_unedited_but_rerecognition_does_not(self):
         saved = [{'review': {'back_added': True}}, {'review': {'rerecognized': True}}]
@@ -134,7 +134,7 @@ class ReviewTest(unittest.TestCase):
     def test_summary_empty_and_legacy_cards_have_unknown_rates(self):
         for saved in ([], [{}]):
             with patch.object(cards, 'list_cards', return_value=saved):
-                self.assertEqual(metrics.summary('123'), {'saved': len(saved), 'unedited_rate': None, 'avg_krw': None})
+                self.assertEqual(metrics.summary('123'), {'saved': len(saved), 'unedited_rate': None, 'avg_krw': None, 'reviewed': 0, 'costed': 0})
 
 
 if __name__ == '__main__':

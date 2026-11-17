@@ -35,7 +35,7 @@ class WireTest(unittest.TestCase):
         def collect():
             yield self.calls
         self.stack.enter_context(patch.object(parser, 'collect', collect, create=True))
-        self.metrics = self.module('metrics', record_edit=Mock(), record_calls=Mock(return_value=2.4), summary=Mock(return_value={'saved': 2, 'unedited_rate': .5, 'avg_krw': 1.0}))
+        self.metrics = self.module('metrics', record_edit=Mock(), record_calls=Mock(return_value=2.4), summary=Mock(return_value={'saved': 2, 'unedited_rate': .5, 'avg_krw': 1.0, 'reviewed': 2, 'costed': 2}))
         self.note = self.module('meeting_note', enabled=Mock(return_value=True), enqueue=Mock(side_effect=lambda card: card.update(note={'state': 'pending', 'text': 'fixture', 'attempts': 0, 'next_at': 0})), drain=Mock(return_value={'written': 0, 'pending': 1, 'automation': 'not_determined'}), status=Mock(return_value={'automation': 'not_determined', 'pending': 1, 'last_notice_at': None}), request_automation=Mock(return_value='authorized'), _state=Mock(side_effect=lambda **fields: cards.save_state('notes', {**cards.load_state('notes'), **fields})))
         self.export = self.module('export_csv', build=Mock(return_value=(b'csv', 2)))
 
@@ -200,7 +200,9 @@ class WireTest(unittest.TestCase):
         telegram.schedule_note_drain('token')
         telegram.handle_callback('token', {'data': 'na'}, 42)
         telegram.handle_callback('token', {'data': 'nc'}, 42)
-        self.send.assert_not_called()
+        # Old buttons get an explicit answer; no notice, drain or permission prompt.
+        self.assertEqual([c.args[2] for c in self.send.call_args_list],
+                         ['메모 기능이 꺼져 있습니다(BIZCARD_MEETING_NOTE=off).'] * 2)
         self.note.drain.assert_not_called()
         self.note.request_automation.assert_not_called()
         self.assertNotIn('Mac 권한', chat_ux.save_result_text(card, {'ok': True, 'message': 'Fixture'}))
@@ -237,7 +239,7 @@ class WireTest(unittest.TestCase):
         args = document.call_args
         self.assertEqual(args.args[2], b'csv')
         self.assertRegex(args.args[3], r'^bizcards-\d{8}\.csv$')
-        self.assertEqual(args.kwargs['caption'], '저장한 명함 2건 · 수정 없이 저장 50% · 평균 1.0원')
+        self.assertEqual(args.kwargs['caption'], '저장한 명함 2건 · 수정 없이 저장 50%(기록 2건) · 평균 1.00원(기록 2건)')
 
     def test_empty_export_and_oversize_do_not_send_document(self):
         with patch.object(telegram, 'send_document', create=True) as document:

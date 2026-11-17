@@ -93,6 +93,8 @@ def check_apple() -> Check:
 
 def check_notes() -> Check:
     from . import meeting_note
+    if not meeting_note.enabled():
+        return Check("notes", True, "메모 기능 꺼짐(BIZCARD_MEETING_NOTE=off)")
     saved = meeting_note.status()
     label = {"authorized": "허용됨", "not_determined": "아직 묻지 않음", "denied": "거부됨"}.get(
         saved["automation"], "확인 안 됨")

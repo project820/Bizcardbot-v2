@@ -47,7 +47,8 @@ def now() -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S%z")
 
 
-def new_card(chat_id, *, media_group_id: Optional[str] = None, source: str = "telegram") -> dict:
+def new_card(chat_id, *, media_group_id: Optional[str] = None, source: str = "telegram",
+             caption: str = "") -> dict:
     card_id = time.strftime("%y%m%d") + secrets.token_hex(3)
     card = {
         "id": card_id,
@@ -59,7 +60,7 @@ def new_card(chat_id, *, media_group_id: Optional[str] = None, source: str = "te
         "created_at": now(),
         "updated_at": now(),
         "media_group_id": media_group_id,
-        "caption": "",
+        "caption": caption.strip()[:300],
         "images": {},
         "draft": {},
         "front_draft": None,
@@ -241,18 +242,31 @@ def save_state(name: str, data: dict) -> None:
     _atomic_write(CARD_DIR / f"_{name}.state", json.dumps(data, ensure_ascii=False, indent=2))
 
 
-def group_caption(card: dict, caption: str = "") -> str:
-    """Keep album captions durable without acquiring another card's lock."""
+def group_caption(card: dict, caption: str = "") -> tuple[str, bool]:
+    """Return the first album caption and whether this call registered it.
+
+    Writes expire entries after 48 hours. Legacy strings acquire a timestamp
+    on the next write, since their original registration time is unknown.
+    No other card's lock is acquired here.
+    """
     group = card.get("media_group_id")
     if not group:
-        return ""
+        return "", False
     key = str(card["chat_id"]) + ":" + str(group)
     with _caption_lock:
         saved = load_state("album_captions")
-        if not saved.get(key) and caption.strip():
-            saved[key] = caption.strip()[:300]
+        registered = False
+        if caption.strip():
+            timestamp = time.time()
+            saved = {key: {"caption": value, "created_at": timestamp} if isinstance(value, str) else value
+                     for key, value in saved.items()
+                     if isinstance(value, str) or timestamp - value["created_at"] <= 48 * 3600}
+            if not saved.get(key):
+                saved[key] = {"caption": caption.strip()[:300], "created_at": timestamp}
+                registered = True
             save_state("album_captions", saved)
-        return saved.get(key, "")
+        value = saved.get(key, "")
+        return (value if isinstance(value, str) else value["caption"]), registered
 
 
 def initialize_followup() -> dict:

@@ -43,6 +43,11 @@ class MeetingNoteTests(unittest.TestCase):
         self.assertEqual(len(self.notes.compose(card, draft, '나' * 400)), 2000)
         self.assertIn('만남 메모: ' + '나' * 300 + '\n', self.notes.compose(card, draft, '나' * 400))
 
+    def test_compose_survives_missing_or_null_created_at(self):
+        for created in (None, '', 12345):
+            text = self.notes.compose({'id': '2611180a0b0c', 'created_at': created}, CardDraft())
+            self.assertEqual(text, '[명함 날짜 미기재 #0a0b0c]')
+
     def test_new_job_contact_does_not_claim_previous_employer(self):
         text = self.notes.compose({'id': '123456', 'job_choice': 'new', 'job_change': {'company': 'example.com'}}, CardDraft())
         self.assertNotIn('이전 소속', text)
@@ -95,13 +100,25 @@ class MeetingNoteTests(unittest.TestCase):
         self.assertEqual(cards.load_card(card['id'])['note']['state'], 'failed')
         self.assertEqual(cards.load_card(card['id'])['status'], 'saved')
 
-    def test_expired_work_does_not_issue_another_write(self):
+    def test_expired_work_gets_one_write_after_downtime(self):
         card = self.card()
         card['note'].update(first_attempt_at=1, attempts=4, next_at=900)
         cards.save_card(card)
         with patch.object(apple_contacts, 'automation_status', return_value='authorized'), patch.object(apple_contacts, 'set_note') as write, patch.object(self.notes.time, 'time', return_value=86401):
             self.notes.drain()
-        write.assert_not_called()
+        write.assert_called_once()
+        note = cards.load_card(card['id'])['note']
+        self.assertEqual(note['state'], 'written')
+
+    def test_expired_retry_attempts_before_failing_even_between_due_times(self):
+        card = self.card('people/test')
+        card['note'].update(first_attempt_at=100000, attempts=99, next_at=187000)
+        cards.save_card(card)
+        error = contacts.ContactSaveError('fixture', kind='auth')
+        with patch.object(contacts, 'set_note', side_effect=error) as write, patch.object(
+                self.notes.time, 'time', return_value=186400):
+            self.notes.drain()
+        write.assert_called_once()
         note = cards.load_card(card['id'])['note']
         self.assertEqual(note['state'], 'failed')
         self.assertTrue(note['notice_pending'])
@@ -186,8 +203,11 @@ class MeetingNoteTests(unittest.TestCase):
                 self.assertEqual(note['attempts'], 1)
                 self.assertEqual(note['next_at'], 100060)
                 with patch.object(apple_contacts, 'automation_status', return_value='authorized'), patch.object(
-                        self.notes.time, 'time', return_value=186400):
+                        self.notes.time, 'time', return_value=186400), patch.object(
+                        backend, 'set_note', side_effect=contacts.ContactSaveError('fixture', kind=kind)) as write, patch.object(
+                        self.notes.contact_backend, 'refresh_resource_name', return_value=resource):
                     self.notes.drain()
+                self.assertGreaterEqual(write.call_count, 1)
                 self.assertEqual(cards.load_card(card['id'])['note']['state'], 'failed')
 
     def test_google_note_omits_already_saved_biography_and_keeps_date(self):
