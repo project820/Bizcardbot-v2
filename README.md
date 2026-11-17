@@ -11,10 +11,13 @@ Mac 연락처에서 Google 계정을 선택하면 Google Cloud 설정 없이 동
 처음 설치는 [Quick start](#quick-start)를 따른다.
 v1 사용자는 [업그레이드 방법](CHANGELOG.md)을 따른다.
 
-현재 버전: **2.1.1**
+현재 버전: **2.2.0**
 
 ## 새 소식 (What's new)
 
+- **v2.2.0**은 일본어·중국어 명함 인식과 이직·승진 갱신 선택을 추가한다.
+  저장 후 기본 3일 뒤에 복사할 인사말과 후속 연락 알림을 제공한다.
+  [업그레이드와 설정 변경](CHANGELOG.md#220---2026-11-17)을 확인한다.
 - **v2.1.1**은 릴리스 노트 링크와 공개 전 검사를 고친 패치다. 봇 동작은 v2.1.0과 같다.
 - **v2.1.0**은 Mac 연락처 저장과 계정 선택을 추가한다.
   `python3 -m bizcard_intake setup-contacts`로 연결 방식을 고른다.
@@ -212,7 +215,62 @@ Telegram의 **이미 저장됨 / 다시 저장 / 건너뛰기** 버튼으로 선
 이미 저장됨을 선택하면 추가 저장과 사진 업로드를 생략한다.
 다시 저장을 선택하면 원래 계정에서 새 저장 작업을 시작한다.
 다시 저장 결과에도 사진 실패와 메모 누락, 필드 검증 경고를 표시한다.
+봇은 한 번에 하나만 실행한다. 봇 실행 중에는 CLI 변경 작업을 거절한다.
+`scan`, `save`, `retry-pending`, `migrate-names`, `rollback-names`가 해당한다.
+`doctor`와 `list`는 계속 사용할 수 있다. `list`는 이전 자료를 변환하지 않는다.
+`doctor`는 작성자 잠금이 사용 중인지 비어 있는지 표시한다.
+봇 시작은 기존 작성자의 종료를 최대 20초 기다린다.
+잠금이 계속 사용 중이면 한국어 안내와 함께 종료한다.
+CLI 변경 작업은 봇을 종료한 상태에서 실행한다.
+자동 실행 봇은 `launchctl stop` 후 다시 실행되므로 일반 작업은 Telegram에서 처리한다.
+`migrate-names`와 `rollback-names`는 아래 정비 절차로 실행한다.
+
+1. 자동 실행 서비스를 해제한다.
+   ```bash
+   launchctl unload -w ~/Library/LaunchAgents/com.bizcard.intake.plist
+   ```
+2. `python3 -m bizcard_intake doctor`에서 작성자 잠금이 비었는지 확인한다.
+   사용 중이면 이전 봇의 작업 종료를 기다린다.
+3. 필요한 명령 하나를 실행한다. 롤백 경로는 실제 백업 파일로 바꾼다.
+   ```bash
+   python3 -m bizcard_intake migrate-names --apply
+   # 되돌리기가 필요한 경우에만 실행한다.
+   python3 -m bizcard_intake rollback-names data/name-migration/<backup>.json
+   ```
+4. 작업 결과를 확인한 뒤 자동 실행 서비스를 복구한다.
+   ```bash
+   launchctl load -w ~/Library/LaunchAgents/com.bizcard.intake.plist
+   ```
+
+확인 버튼은 작업 전에 응답해 Telegram의 대기 표시를 끝낸다.
+이직 조회 완료가 카드 잠금과 겹치면 작업자에서 최대 30초 재시도한다.
+재시도 시간이 지나면 이직 제안을 생략하고 일반 저장 버튼을 복구한다.
+조회 대기가 20초 이상이면 저장 요청으로 일반 저장을 진행할 수 있다.
+조회 시작 시각이 없으면 대기 시간이 지난 것으로 처리한다.
+재시작하면 남아 있는 조회 대기 상태를 해제한다.
+답장 대상 선택은 v2.1.1과 같다. 카드의 최근 메시지 참조 20개를 조회한다.
+발신자나 원본 시각으로 별도 판단하지 않는다.
+대상을 찾지 못하면 검토 가능한 명함 한 건을 자동 선택한다.
+텍스트 답장에서 저장·취소된 명함을 찾으면 종료 상태를 안내하고 수정하지 않는다.
+사진 답장은 v2.1.1의 뒷면 대상 선택을 유지한다.
+답장한 명함이 종료됐어도 다른 명함이 뒷면 대기 중이면 그 명함에 추가될 수 있다.
+전송 직후 답장 대상을 메모리에 등록한다.
+메시지 ID는 v2.1.1처럼 호출한 스레드에서 카드 잠금을 기다려 기록한다.
+저장된 카드를 다시 읽고, 없는 ID만 끝에 추가해 마지막 20개를 남긴다.
+기록 시도가 끝나면 성공 여부와 관계없이 메모리 참조를 지운다.
+잠금 대기 중에는 메모리 참조로 원래 명함을 찾는다.
+잠금 대기와 파일 쓰기가 끝날 때까지 해당 호출자는 기다린다.
+따라서 업데이트 처리 중 기록하면 다른 대화의 처리도 늦어질 수 있다.
+OCR·AI 인식 중에는 카드 잠금을 유지하지 않는다.
+기록 실패나 기록 전 종료로 참조를 잃으면 v2.1.1의 자동 선택을 따른다.
+예를 들어 참조 없는 저장 명함 A에 답장하면 검토 명함 B가 선택될 수 있다.
+확인한 초안 메시지에 답장한다.
+인식 중 취소를 요청하면 인식이 끝난 뒤 취소한다. 재시작 후에도 요청을 반영한다.
+처리 중인 카드의 다른 버튼과 수정 요청에는 즉시 대기 안내를 보낸다.
 저장 중에는 수정·뒷면 추가·인식 재시도 버튼으로 명함을 변경하지 않는다.
+저장 여부가 불명확하면 뒷면 사진도 반영하지 않는다. 저장 결과를 확인한 뒤 사진을 다시 보낸다.
+한자가 많은 한국어 명함에서 한자와 한글이 한 줄에 함께 있으면 그 줄의 한글 이름·주소가 빠지거나 한자로 잘못 읽힐 수 있다.
+초안을 확인하고 직접 수정한다. AI가 누락된 한글을 복구하는지는 확인하지 않았다.
 저장 결과를 명함 파일에 기록한 뒤 원본 이미지를 정리한다.
 목록은 저장 중인 명함을 `저장 중`으로 표시한다.
 새 확인 단계에서는 이전 버튼을 사용할 수 없다.
@@ -269,12 +327,50 @@ that cannot read the key deletes `credentials.enc`.
    - 휴대전화: 010-5555-0101
    ...
    ```
+   Only one bot or mutating CLI command can run per data directory.
+   While the bot runs, use Telegram for changes; `doctor` and `list` remain
+   available. `list` no longer migrates legacy records.
+   `doctor` reports whether the writer lock is held or free without changing it.
+   Bot startup polls for up to 20 seconds while the previous writer exits.
+   If still held, startup fails with a Korean message.
+   Lookup completion retries card-lock contention on its worker for up to 30
+   seconds, then restores normal save buttons without a job-change suggestion.
+   A save request may bypass a pending lookup at least 20 seconds old or one
+   without a start timestamp. Restart
+   recovery clears leftover lookup flags. Confirmation buttons are acknowledged
+   before their work starts.
+   Cancellation during recognition takes effect when recognition finishes and
+   survives restart. Other actions on a busy card receive an immediate notice.
    Buttons: 저장 · 직접 수정 · 뒷면 추가 · 인식 재시도 · 취소. For an album the bot
    also sends a summary with "저장 가능한 N건 모두 저장".
+   Horizontal Japanese and Chinese cards are supported. The Korean recognition
+   path is preserved; OCR results matched v2.1.1 on 17 cards (15 Korean, 2 English).
+   On Korean cards with many Chinese characters, Hangul names or addresses on
+   the same line as Chinese characters may be omitted or misread as Chinese
+   characters. Check the draft and correct it manually; AI recovery of omitted
+   Hangul has not been verified.
+   Vertical Japanese body text is unsupported. Rotated vertical text may be
+   misread as Hangul. Check names and companies and correct them manually.
 2. To fix a card, reply to its draft with `항목: 값` lines (`직함: 과장`,
    `휴대전화: 010-1234-5678`, `팩스: -` to clear). These are applied as typed,
    without the AI, and survive re-recognition and back-side merges. Free text
    ("이메일은 kim@acme.com") still goes through the AI reviser.
+   Reply selection retains v2.1.1 behavior, using the last 20 message IDs per
+   card. Sender/date metadata does not change selection. An unresolved reply
+   falls back to the single reviewable card. A TEXT reply resolving to a
+   saved/cancelled card gets the existing closed-state notice and is not edited.
+   Photo replies keep v2.1.1 back-side selection: even a reply to a closed card
+   can add a back side to another card waiting for one.
+   Delivered messages are registered in memory immediately. As in v2.1.1,
+   the calling thread waits for the card lock and writes the message ID.
+   It reloads the card, appends the ID only if absent, and keeps the last 20 IDs.
+   The temporary entry is removed when the write attempt ends, including errors.
+   Replies during the wait resolve through that entry to the original card.
+   Lock waits and disk writes block the caller; recording on the update loop
+   can delay other chats. OCR and AI recognition do not hold the card lock.
+   A failed write or a crash before persistence can lose the reference.
+   As in v2.1.1, replying to an unrecorded saved card A can select the
+   sole reviewable card B. Reply to a verified draft message.
    Cards are processed in parallel (`BIZCARD_WORKERS`, default 30): the model
    calls for every card in an album run at the same time, image prep and OCR
    use at most one slot per CPU core, and saves run in the background so buttons
@@ -290,6 +386,52 @@ that cannot read the key deletes `credentials.enc`.
    saved automatically once Google works again (backoff from 2 minutes up to 6
    hours; checked every minute and at the daily health check). A contact whose
    photo upload failed is saved anyway and the photo is retried.
+5. When a matching name and mobile phone or email have a different company or title, choose
+   `기존 연락처 갱신` to replace the old company/title, or `새 연락처로 저장` to
+   keep a separate contact. Both Mac Contacts and Google direct connections
+   support this. Batch save leaves these cards out and sends each card its own
+   choice buttons. Both the existing contact and the draft must have a company
+   or title before this choice is offered. Empty draft values never erase the
+   existing Mac company, title, or department.
+   The draft appears first; save buttons are attached after the contact lookup.
+   A lookup that exceeds its 3-second request limit can skip this suggestion on
+   very large contact lists. Check `job-change lookup unavailable` in `bot.log`.
+   The first Mac helper build can add up to 30 seconds.
+   An unresolved save freezes the draft and its previous operation until the
+   result is checked, including after a restart.
+6. Newly saved cards get a follow-up reminder after 3 days by default. Long-press
+   the greeting to copy it, then send it yourself. Fixed Korean, Japanese, Chinese
+   and English templates add no AI cost. Names select the template language;
+   Taiwan/Hong Kong numbers (+886/+852) or traditional-only characters select
+   traditional Chinese; other Chinese names use simplified Chinese.
+   A Japanese name written only in kanji gets the Chinese template, so edit it
+   before sending. Cards saved before the upgrade do not get reminders.
+   Reminders arrive 10:00–18:59 in `BIZCARD_TZ` (system local time when empty).
+   An invalid value also uses system local time, logs one fixed warning, and
+   produces a warning in `doctor`. Use `Asia/Seoul`, not `KST`.
+   Set `BIZCARD_FOLLOWUP_DAYS=0` in `.env` to disable them, or change `3` to the
+   number of days you prefer, then restart the bot.
+
+| Reminder button | Action |
+| --- | --- |
+| `보냈어요` | Ends follow-up reminders for this card. |
+| `3일 뒤 다시` | Reminds you again in 3 days. |
+| `이 명함은 그만` | Stops reminders for this card without marking it sent. |
+| `알림 끄기` | Turns off all follow-up reminders and shows `알림 다시 켜기`. |
+| `알림 다시 켜기` | Enables pending reminders and reminders for future saves. |
+
+Send `/alerts` or `알림 설정` at any time to turn reminders on or off.
+Re-enabling does not revive a card already marked sent, stopped, or disabled;
+this includes the card whose reminder you used to turn all reminders off.
+`BIZCARD_FOLLOWUP_DAYS=0` still prevents sending: change it to a positive number
+and restart the bot first.
+
+A reminder interrupted during sending is not automatically resent, to prevent
+duplicates; an uncertain delivery can therefore be missed.
+Each reminder makes one HTTP attempt (10-second timeout), without retrying or
+waiting on Telegram 429 responses. A failed attempt remains marked as attempted
+and is not automatically resent. Network sending releases the card and reminder
+locks, so other cards can finish saving while delivery is in progress.
 
 Cards live in `data/cards/<id>.json` (one file each, atomic writes). Old
 `data/sessions` and `data/pending_contacts` files are migrated on startup:
@@ -323,14 +465,28 @@ own.
 
 ### Renaming contacts saved with the old layout
 
-Contacts saved before November 2026 have the company in the family name. Run in
-Terminal:
+Contacts saved before November 2026 have the company in the family name.
+For a launchd installation, unload the service first (`stop` restarts it):
+
+```bash
+launchctl unload -w ~/Library/LaunchAgents/com.bizcard.intake.plist
+python3 -m bizcard_intake doctor
+```
+
+Wait until `writer` reports the lock is free. Run the required maintenance
+command from the project directory (replace `<backup>` with the actual file):
 
 ```bash
 python3 -m bizcard_intake migrate-names                # preview
 python3 -m bizcard_intake migrate-names --apply --limit 1
 python3 -m bizcard_intake migrate-names --apply        # everything, backup first
 python3 -m bizcard_intake rollback-names data/name-migration/<backup>.json
+```
+
+After checking the maintenance result, restore automatic startup:
+
+```bash
+launchctl load -w ~/Library/LaunchAgents/com.bizcard.intake.plist
 ```
 
 Only the name field changes; phones, company, photo and notes are untouched.
