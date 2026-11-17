@@ -3,7 +3,7 @@
 프로젝트 운영자가 Cloudflare Workers에 설치 도우미 하나를 배포한다.
 설치기는 설치 도우미에 pairing을 만들고 관리 봇으로 사용자를 안내한다.
 관리 봇은 Bot Management Mode를 켠 운영자 봇을 뜻한다.
-예시 관리 봇 username은 `BizcardSetupBot`으로 설정한다.
+기본 설치 도우미는 프로젝트 운영자가 운영하는 `@BizcardSetupBot`이다.
 
 일반 사용자는 Worker를 직접 배포하지 않는다.
 관리 봇이 만든 개인 명함봇의 토큰은 수령 코드 확인 후 전달한다.
@@ -11,8 +11,12 @@
 
 ## 신뢰 범위
 
-관리 봇 운영자는 `getManagedBotToken`으로 개인 명함봇 토큰을 다시 조회할 수 있다.
-이 운영자 권한을 원하지 않으면 설치기의 `--manual` 경로를 사용한다.
+설치 도우미(@BizcardSetupBot)는 개인 명함봇 토큰을 저장하지 않는다.
+설치 도우미는 명함 사진과 Google 계정에 접근하지 않는다.
+다만 Telegram 구조상 도우미 운영자는 `getManagedBotToken`으로 내 봇의 토큰을 다시 조회할 수 있다.
+토큰이 있으면 봇에 온 메시지를 읽을 수 있다.
+이 운영자 권한을 원하지 않으면 `python3 -m bizcard_intake setup-telegram --manual`로 직접 만든다.
+이 경로는 설치 도우미를 거치지 않는다.
 relay가 토큰을 저장하지 않아도 운영자의 재조회 권한은 남는다.
 사용자가 BotFather에서 토큰을 재발급할 수 있는지는 미확인이다.
 재발급이 가능하더라도 관리 권한에 미치는 영향은 별도로 확인해야 한다.
@@ -75,8 +79,9 @@ npx tsc --noEmit
 npx wrangler login
 ```
 
-`workers_dev=false`이므로 기본 `workers.dev` 주소를 사용하지 않는다.
-다음 사용자 도메인 예시를 `wrangler.toml`에 추가한다.
+기본 설정(`workers_dev=true`)은 계정의 `workers.dev` 주소로 배포한다.
+공식 배포 주소는 `https://bizcard-onboarding-relay.bizcardbot.workers.dev`다.
+자기 도메인을 쓰려면 `workers_dev=false`로 바꾸고 아래 예시를 `wrangler.toml`에 추가한다.
 `setup.example.com`은 운영자가 소유한 실제 도메인으로 바꾼다.
 
 ```toml
@@ -229,10 +234,12 @@ ack와 만료 처리에서 이름과 사용자 정보를 제거한다.
 `/start`는 private chat의 `message.from.id == message.chat.id`만 허용한다.
 다른 사용자에게 결합된 링크에는 `이미 사용된 링크` 안내를 보낸다.
 같은 사용자가 새 pairing을 연결하면 이전 pairing은 `expired`가 된다.
-생성 주 신호는 결합 사용자의 private `message.managed_bot_created`다.
-보조 `managed_bot` 신호는 결합 사용자가 일치하고 상태가 `started`일 때만 받는다.
-이 보조 신호의 `bot.username`은 pairing의 `suggested_username`과 대소문자를 무시하고 일치해야 한다.
-결합 사용자가 보조 링크에서 핸들을 바꿔 만들었다면 설치를 다시 시작하고 새 제안 핸들로 재시도한다.
+`/start` 응답은 공식 생성 링크 `https://t.me/newbot/<관리 봇>/<제안 핸들>?name=<이름>`을 인라인 버튼 하나로 보낸다.
+iPhone 앱이 `request_managed_bot` 키보드 버튼을 빈 대화 선택 화면으로 열어서 링크 버튼으로 바꿨다.
+생성 신호는 결합 사용자의 private `message.managed_bot_created`와 `managed_bot` update다.
+`managed_bot` 신호는 결합 사용자가 일치하고 상태가 `started`일 때만 받는다.
+이 신호의 `bot.username`은 pairing의 `suggested_username`과 대소문자를 무시하고 일치해야 한다.
+결합 사용자가 핸들을 바꿔 만들었다면 설치를 다시 시작하고 새 제안 핸들로 재시도한다.
 `created` 이후 생성 중복과 `managed_bot` 토큰·소유자 변경은 무시한다.
 상태 전이가 중복 코드 전송을 막는다.
 

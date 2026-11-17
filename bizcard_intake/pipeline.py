@@ -23,7 +23,7 @@ from .contacts import ContactSaveError, SaveResult, save_contact, upload_photo
 from .draft import CardDraft, apply_edits, parse_edits, preserve_locked
 from .image_processing import PreparedImages, prepare_card_images as _prepare_card_images
 from .parser import merge_drafts, parse_card, revise_draft
-from .vision_ocr import OcrResult, extract_text, vote_orientation
+from .vision_ocr import OcrResult, extract_text, vote_orientation, stage_timer
 
 DATA_DIR = Path("data/telegram_photos")
 LOG_DIR = Path("data/logs")
@@ -86,18 +86,24 @@ def _orientation(prepared: PreparedImages, ocr: OcrResult) -> tuple[int, float, 
 
 def _prepare_oriented(source: Path, profile: Path) -> tuple[PreparedImages, OcrResult, bool]:
     """Share the same one-retry orientation check between front and back."""
-    prepared = prepare_card_images(source, profile)
-    ocr = _ocr(prepared.ocr_path)
-    quarters, share, total = _orientation(prepared, ocr)
+    with stage_timer("prepare"):
+        prepared = prepare_card_images(source, profile)
+    with stage_timer("ocr"):
+        ocr = _ocr(prepared.ocr_path)
+    with stage_timer("orientation"):
+        quarters, share, total = _orientation(prepared, ocr)
     log.info("orientation image=%s quarters=%d share=%.3f total=%.1f", source.name, quarters, share, total)
     if total < ORIENTATION_MIN_TOTAL or share < ORIENTATION_MIN_SHARE:
         return prepared, ocr, True
     if quarters == 0:
         return prepared, ocr, False
     try:
-        rotated = prepare_card_images(source, profile, rotate_quarters=quarters, reuse=prepared)
-        rotated_ocr = _ocr(rotated.ocr_path)
-        verified, verified_share, verified_total = _orientation(rotated, rotated_ocr)
+        with stage_timer("reprepare"):
+            rotated = prepare_card_images(source, profile, rotate_quarters=quarters, reuse=prepared)
+        with stage_timer("reocr"):
+            rotated_ocr = _ocr(rotated.ocr_path)
+        with stage_timer("reorientation"):
+            verified, verified_share, verified_total = _orientation(rotated, rotated_ocr)
         if verified == 0 and verified_total >= ORIENTATION_MIN_TOTAL and verified_share >= ORIENTATION_MIN_SHARE:
             return rotated, rotated_ocr, False
         log.warning("orientation verification failed image=%s quarters=%d share=%.3f total=%.1f", source.name, verified, verified_share, verified_total)
@@ -105,7 +111,8 @@ def _prepare_oriented(source: Path, profile: Path) -> tuple[PreparedImages, OcrR
         log.warning("orientation retry failed image=%s", source.name, exc_info=True)
     # Outputs share paths: regenerate the first-pass images from its untouched
     # rectification, retaining its OCR without another recognition attempt.
-    restored = prepare_card_images(source, profile, reuse=prepared)
+    with stage_timer("restore_prepare"):
+        restored = prepare_card_images(source, profile, reuse=prepared)
     return restored, ocr, True
 
 
@@ -140,7 +147,7 @@ def set_draft(card: dict, draft: CardDraft, event: str) -> None:
 
 def scan_front(front_path: Path) -> dict:
     """Image prep + OCR + parse for one front photo. Returns images and draft."""
-    started = time.monotonic()
+    started = time.perf_counter()
     prepared, ocr, orientation_warning = _prepare_oriented(front_path, profile_image_path(front_path))
     images = {
         "front": str(front_path),
@@ -153,7 +160,9 @@ def scan_front(front_path: Path) -> dict:
     draft = parse_card(prepared.llm_path, ocr, "front")
     if orientation_warning and ORIENTATION_WARNING not in draft.warnings:
         draft.warnings.append(ORIENTATION_WARNING)
-    log.info("front draft done image=%s elapsed=%.1fs", front_path.name, time.monotonic() - started)
+    elapsed = time.perf_counter() - started
+    log.info("perf stage=scan_front seconds=%.6f", elapsed)
+    log.info("front draft done image=%s elapsed=%.1fs", front_path.name, elapsed)
     return {"images": images, "rectifier": prepared.source_used, "draft": draft}
 
 

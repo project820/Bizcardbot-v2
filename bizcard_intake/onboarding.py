@@ -24,7 +24,11 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qs, urlsplit
 from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-DEFAULT_ONBOARDING_URL = "https://bizcard-setup.example.invalid"
+from . import __version__
+from .envfile import read_settings
+
+DEFAULT_ONBOARDING_URL = "https://bizcard-onboarding-relay.bizcardbot.workers.dev"
+USER_AGENT = f"Bizcardbot-setup/{__version__}"
 TELEGRAM_API_BASE = "https://api.telegram.org"
 PAIRING_TIMEOUT = 600
 MANUAL_TIMEOUT = 120
@@ -66,7 +70,8 @@ def validate_base_url(url: str, *, allow_insecure_localhost: bool = False) -> st
 
 
 def _request_json(url, *, data=None, bearer=None, timeout=10):
-    headers = {"Accept": "application/json"}
+    # Cloudflare rejects the default Python-urllib agent (error 1010).
+    headers = {"Accept": "application/json", "User-Agent": USER_AGENT}
     encoded = None
     if data is not None:
         encoded = json.dumps(data, ensure_ascii=False).encode("utf-8")
@@ -109,6 +114,18 @@ def _verify_token(base, token):
             or not USERNAME_PATTERN.fullmatch(result["username"])):
         raise SetupError("getMe에서 봇 정보를 확인하지 못했습니다. 토큰을 다시 확인하세요.")
     return result
+
+
+def _verify_claimed_token(base, token, *, sleep):
+    # A freshly created bot can briefly fail getMe; one transient error must not
+    # discard a successful claim (the relay keeps it until ack or expiry).
+    for attempt in range(3):
+        try:
+            return _verify_token(base, token)
+        except SetupError:
+            if attempt == 2:
+                raise SetupError("새 봇 확인(getMe)에 실패했습니다. 잠시 후 setup-telegram을 다시 실행하세요.") from None
+            sleep(POLL_INTERVAL)
 
 
 def _positive_id(value):
@@ -314,7 +331,7 @@ def _clipboard_token():
 def _manual(base, name, *, input_fn, secret_input, output, sleep, clock, started_at):
     print("BotFather 수동 설정을 진행합니다.", file=output)
     print("1. Telegram에서 공식 @BotFather를 열고 /newbot을 보내세요.", file=output)
-    print(f"2. 표시 이름으로 {name}을 입력하세요.", file=output)
+    print(f"2. 표시 이름을 입력하세요. 예: {name}", file=output)
     print("3. bot으로 끝나는 영문 사용자 이름을 입력하세요.", file=output)
     print("4. BotFather가 준 토큰을 아래에 붙여넣으세요. 입력은 숨겨집니다.", file=output)
     token = _clipboard_token()
@@ -479,11 +496,23 @@ def setup_telegram(*, env_path=None, relay_url=None, telegram_api_base=TELEGRAM_
                 print("기존 봇 연결을 유지했습니다.", file=output)
                 return 1
         base = validate_base_url(telegram_api_base, allow_insecure_localhost=allow_insecure_localhost)
-        relay = relay_url if relay_url is not None else os.environ.get("BIZCARD_ONBOARDING_URL", DEFAULT_ONBOARDING_URL)
-        if not manual and relay and relay != DEFAULT_ONBOARDING_URL:
+        relay = relay_url
+        if relay is None:
+            relay = os.environ.get("BIZCARD_ONBOARDING_URL")
+        if relay is None:
+            try:
+                settings = read_settings(path) if path.exists() else {}
+            except (ValueError, UnicodeError):
+                raise SetupError(".env 설정을 읽지 못했습니다. 대입문과 따옴표를 확인하세요.") from None
+            relay = settings.get("BIZCARD_ONBOARDING_URL", DEFAULT_ONBOARDING_URL)
+        if not manual and relay:
             relay = validate_base_url(relay, allow_insecure_localhost=allow_insecure_localhost)
-            print("자동 연결은 설치 도우미 서버를 거칩니다. 원치 않으면 --manual", file=output)
-            print("설치 도우미 운영자는 기술적으로 이 봇의 토큰을 다시 발급받을 수 있습니다.", file=output)
+            print("자동 연결은 프로젝트 운영자의 설치 도우미(@BizcardSetupBot)를 거칩니다.", file=output)
+            print("도우미는 내 봇의 토큰을 저장하지 않습니다.", file=output)
+            print("도우미는 명함 사진과 Google 계정에 접근하지 않습니다.", file=output)
+            print("다만 Telegram 구조상 도우미 운영자는 내 봇의 토큰을 다시 조회할 수 있습니다.", file=output)
+            print("토큰이 있으면 봇에 온 메시지를 읽을 수 있습니다.", file=output)
+            print("원치 않으면 python3 -m bizcard_intake setup-telegram --manual 로 직접 만드세요.", file=output)
             try:
                 ready, poll_token = _pair(relay, name, no_open=no_open, input_fn=input_fn,
                                           output=output, sleep=sleep, clock=clock)
@@ -492,7 +521,7 @@ def setup_telegram(*, env_path=None, relay_url=None, telegram_api_base=TELEGRAM_
                 manual = True
             else:
                 token = ready.get("bot_token")
-                bot = _verify_token(base, token)
+                bot = _verify_claimed_token(base, token, sleep=sleep)
                 if bot["id"] != ready["bot_id"] or bot["username"] != ready.get("bot_username"):
                     raise SetupError("검증한 봇과 설치 도우미의 봇 정보가 다릅니다. 저장하지 않았습니다.")
                 chat_id = ready["owner_user_id"]

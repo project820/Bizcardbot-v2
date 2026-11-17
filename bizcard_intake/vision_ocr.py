@@ -9,6 +9,8 @@ import subprocess
 import os
 import tempfile
 import threading
+import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
@@ -19,6 +21,16 @@ VISION_OCR_SOURCE = PROJECT_ROOT / "scripts" / "vision_ocr.swift"
 VISION_OCR_BINARY = PROJECT_ROOT / ".cache" / "vision_ocr"
 
 log = logging.getLogger("bizcard")
+
+
+@contextmanager
+def stage_timer(stage: str):
+    """Record elapsed wall time without including card contents or credentials."""
+    started = time.perf_counter()
+    try:
+        yield
+    finally:
+        log.info("perf stage=%s seconds=%.6f", stage, time.perf_counter() - started)
 
 
 @dataclass(frozen=True)

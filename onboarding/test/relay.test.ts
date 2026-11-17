@@ -89,16 +89,17 @@ describe('pairing contract v2', () => {
     expect(snapshot()).not.toContain(p.poll_token);
     expect(await (await poll(p)).json()).toEqual({status:'pending'});
   });
-  it('offers a persistent creation keyboard and a separate encoded fallback link', async () => {
+  it('offers one official creation link button and repeats it when the label is typed', async () => {
     const name='명함 & 이름'; const p=await create('192.0.2.1',name); await start(p);
     expect(await (await poll(p)).json()).toEqual({status:'started'});
-    const keyboard=calls[0].body.reply_markup;
-    expect(keyboard.resize_keyboard).toBe(true); expect(keyboard).not.toHaveProperty('one_time_keyboard');
-    const button=keyboard.keyboard[0][0];
-    expect(button).toMatchObject({text:'내 명함봇 만들기',request_managed_bot:{suggested_name:name,suggested_username:p.suggested_username}});
-    const id=button.request_managed_bot.request_id;
-    expect(Number.isInteger(id) && id >= -2147483648 && id <= 2147483647).toBe(true);
-    expect(calls[1].body.reply_markup.inline_keyboard[0][0]).toEqual({text:'버튼이 안 보이면 여기를 누르세요',url:`https://t.me/newbot/BizcardSetupBot/${p.suggested_username}?name=${encodeURIComponent(name)}`});
+    const link={text:'▶ 명함봇 만들기',url:`https://t.me/newbot/BizcardSetupBot/${p.suggested_username}?name=${encodeURIComponent(name)}`};
+    expect(calls).toHaveLength(1);
+    expect(calls[0].body.reply_markup).toEqual({inline_keyboard:[[link]]});
+    await webhook({message:{from:user,chat:{id:user.id,type:'private'},text:'▶ 명함봇 만들기'}});
+    expect(calls[1].body.reply_markup.inline_keyboard[0][0]).toEqual(link);
+    const stranger={id:999,is_bot:false,first_name:'남'};
+    await webhook({message:{from:stranger,chat:{id:999,type:'private'},text:'▶ 명함봇 만들기'}});
+    expect(calls).toHaveLength(2);
   });
   it('does not hand an attacker with poll_token a victim token without the Telegram code', async () => {
     const p=await ready();
@@ -265,5 +266,57 @@ describe('pairing contract v2', () => {
     const p=await ready(); transport.mockRejectedValueOnce(new Error(`${env.MANAGER_BOT_TOKEN} ${p.poll_token} ${pairId(p)} ${botToken}`)); await claim(p);
     const logs=JSON.stringify(spies.flatMap(spy=>spy.mock.calls));
     for(const value of [env.MANAGER_BOT_TOKEN,secret,botToken,p.poll_token,pairId(p),code()]) expect(logs).not.toContain(value);
+  });
+  it('logs only method, HTTP status and numeric diagnostics from Telegram failures', async () => {
+    const spies=['log','info','warn','error','debug'].map(method=>vi.spyOn(console,method as 'log').mockImplementation(()=>{}));
+    const p=await ready();
+    const confirmationCode=code();
+    const description=`${env.MANAGER_BOT_TOKEN} ${secret} ${botToken} ${p.poll_token} ${pairId(p)} ${confirmationCode} ${user.id}`;
+    transport.mockResolvedValueOnce(Response.json({ok:false,description,error_code:429,parameters:{retry_after:30}},{status:429}));
+    const response=await claim(p,confirmationCode);
+    expect(response.status).toBe(503);
+    expect(await response.json()).toEqual({error:'잠시 후 다시 시도하세요.'});
+    const logs=JSON.stringify(spies.flatMap(spy=>spy.mock.calls));
+    for(const value of [env.MANAGER_BOT_TOKEN,secret,botToken,p.poll_token,pairId(p),confirmationCode,String(user.id)]) expect(logs).not.toContain(value);
+    expect(console.error).toHaveBeenCalledWith('relay-error','관리 봇 요청 실패: getManagedBotToken 429 error_code=429 retry_after=30');
+  });
+  it('discards unvalidated Telegram diagnostic fields', async () => {
+    const error=vi.spyOn(console,'error').mockImplementation(()=>{});
+    const p=await ready();
+    transport.mockResolvedValueOnce(Response.json({ok:false,error_code:botToken,parameters:{retry_after:p.poll_token}},{status:400}));
+    expect((await claim(p)).status).toBe(503);
+    expect(error).toHaveBeenCalledWith('relay-error','관리 봇 요청 실패: getManagedBotToken 400');
+  });
+  it.each(['Error','TypeError','untrusted name'])('never logs or returns a bot-token URL from network exceptions (%s)', async kind => {
+    const spies=['log','info','warn','error','debug'].map(method=>vi.spyOn(console,method as 'log').mockImplementation(()=>{}));
+    const p=await ready();
+    const url=`https://api.telegram.org/bot${env.MANAGER_BOT_TOKEN}/getManagedBotToken`;
+    const failure=kind==='TypeError' ? new TypeError(`fetch failed: ${url}`) : new Error(`fetch failed: ${url}`);
+    if(kind==='untrusted name') failure.name=url;
+    transport.mockRejectedValueOnce(failure);
+    const response=await claim(p);
+    expect(response.status).toBe(503);
+    const body=await response.text();
+    const logs=JSON.stringify(spies.flatMap(spy=>spy.mock.calls));
+    expect(body).not.toContain(url); expect(body).not.toContain(env.MANAGER_BOT_TOKEN);
+    expect(logs).not.toContain(url); expect(logs).not.toContain(env.MANAGER_BOT_TOKEN);
+    expect(console.error).toHaveBeenCalledWith('relay-error',kind==='TypeError' ? 'TypeError' : 'Error');
+  });
+});
+
+describe('default transport', () => {
+  it('calls the global fetch unbound, as Workers requires', async () => {
+    const seen: unknown[] = [];
+    vi.stubGlobal('fetch', vi.fn(function (this: unknown) {
+      if (this !== undefined && this !== globalThis) throw new TypeError('Illegal invocation');
+      seen.push('called');
+      return Promise.resolve(Response.json({ok: true, result: true}));
+    }));
+    const real = new PairingsObject(new MemoryState(storage) as unknown as DurableObjectState, env);
+    object = real;
+    const pair = await create();
+    const response = await start(pair);
+    expect(response.status).toBe(200);
+    expect(seen.length).toBeGreaterThan(0);
   });
 });

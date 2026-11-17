@@ -23,7 +23,7 @@ from pathlib import Path
 from typing import Optional
 
 from .draft import CardDraft
-from .vision_ocr import OcrResult
+from .vision_ocr import OcrResult, stage_timer
 
 SCHEMA_PATH = Path(__file__).resolve().parent / "card_schema.json"
 DEFAULT_CODEX_MODEL = "gpt-5.6-luna"
@@ -127,7 +127,8 @@ def card_prompt(ocr: OcrResult, side: str) -> str:
 
 
 def parse_card(image_path: Path, ocr: OcrResult, side: str) -> CardDraft:
-    prompt = card_prompt(ocr, side)
+    with stage_timer("prompt"):
+        prompt = card_prompt(ocr, side)
     if crosscheck_enabled():
         data = run_crosscheck(prompt, image_path, ocr.text or "")
     else:
@@ -155,7 +156,17 @@ def run_crosscheck(prompt: str, image_path: Path, ocr_text: str) -> Optional[dic
 
     def safe(fn, name):
         try:
-            return fn(prompt, image_path)
+            with stage_timer("luna" if name == "openai" else "haiku"):
+                model_prompt = prompt
+                if name == "anthropic":
+                    # The merge uses Luna's warnings; keep Haiku's diagnostics
+                    # useful for fallback without narrating every valid field.
+                    model_prompt += (
+                        "\n교차 검증용 판독이다. 연락처 필드와 notes는 빠짐없이 읽어라. "
+                        "warnings에는 실제 판독 문제만 '항목: 사유'로 짧게 적어라. "
+                        "정상 항목의 확인 설명, 추출 과정, 규칙 설명은 쓰지 마라. 문제가 없으면 []로 써라."
+                    )
+                return fn(model_prompt, image_path)
         except Exception as exc:
             log.warning("%s failed in cross-check: %s", name, exc)
             return None
@@ -168,7 +179,8 @@ def run_crosscheck(prompt: str, image_path: Path, ocr_text: str) -> Optional[dic
         return run_backend(prompt, image_path=image_path)  # both APIs down: CLI fallback
     if a is None or b is None:
         return a or b
-    return crosscheck_merge(a, b, ocr_text)
+    with stage_timer("merge"):
+        return crosscheck_merge(a, b, ocr_text)
 
 
 def run_anthropic(prompt: str, image_path: Optional[Path]) -> dict:

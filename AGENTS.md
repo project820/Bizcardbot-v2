@@ -1,7 +1,28 @@
-# Agent rules for this repository
+# 저장소 에이전트 규칙
 
-- gws keeps its credentials with the file key backend (`~/.config/gws/.encryption_key`). Every gws call must run with `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file`; it is set in `.env` (the bot) and `~/.zshenv` (shells). Without it gws tries the macOS keychain, cannot decrypt `credentials.enc` and deletes it, logging the bot out of Google (happened on 2026-11-03).
-- Re-login when needed: `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file gws auth login --scopes https://www.googleapis.com/auth/contacts`, then finish the Google consent page in the browser with the Google account that should receive the contacts.
-- Tests must mock `contacts.run_gws`; run them with `python3 -B -m unittest discover -s tests`.
-- Keep image processing (rectify, OCR sizing, profile crop) unchanged unless the user asks; it is tuned and the user is happy with it.
-- Restarting the bot: `launchctl stop com.bizcard.intake` (launchd relaunches it).
+- 이 저장소에서 커밋할 때는 반드시 `RELEASING.md`를 따른다.
+- 커밋 메시지는 Conventional Commits 형식으로 작성한다.
+- `main`에 올리는 변경마다 `CHANGELOG.md`의 `[Unreleased]`를 갱신한다.
+- 릴리스 커밋은 변경 기록을 버전 절로 확정하고 `[Unreleased]`를 비운다.
+- 사용자에게 보이는 변화가 있으면 README와 관련 문서를 갱신한다.
+- 공개 `main`에 올리기 전에 버전을 올리고 릴리스 커밋으로 마무리한다.
+- 문서만 고친 변경도 PATCH로 릴리스한다.
+- 공개 뒤 수정은 새 PATCH로 제공하고 기존 태그는 옮기지 않는다.
+- GitHub 릴리스는 초안으로 만들고 본문과 링크를 확인한 뒤 공개한다.
+- 설정이 바뀌면 `.env.example`과 업그레이드 안내도 갱신한다.
+- 버전의 단일 원천은 `bizcard_intake/__init__.py`의 `__version__`으로 한다.
+- 두 Node 패키지와 lockfile 루트의 버전도 동일하게 유지한다.
+- 릴리스는 `.venv/bin/python scripts/release.py check` 통과 후 진행한다.
+- 커밋과 태그 생성, 푸시와 릴리스 공개는 명시적 승인 후 실행한다.
+- 공개 저장소이므로 개인 정보와 비밀값을 커밋하지 않는다.
+- 운영 데이터 `data/`와 `.env`는 커밋하지 않는다.
+- 테스트는 `contacts.run_gws`를 모킹한다.
+- 테스트는 `.venv/bin/python -m unittest discover -s tests`로 실행한다.
+- gws는 항상 `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file`로 실행한다.
+- gws 복호화 키는 `~/.config/gws/.encryption_key`에서 관리한다.
+- keychain 모드의 복호화 실패는 `credentials.enc`를 삭제하므로 사용하지 않는다.
+- 재로그인은 `GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file gws auth login --scopes https://www.googleapis.com/auth/contacts`로 수행한다.
+- 명함을 저장할 Google 계정으로 브라우저 동의를 완료한다.
+- 이미지 처리와 OCR 크기, 프로필 자르기는 요청 없이 변경하지 않는다.
+- 봇 재시작은 `launchctl stop com.bizcard.intake`로 수행한다.
+- launchd가 봇을 다시 실행한다.

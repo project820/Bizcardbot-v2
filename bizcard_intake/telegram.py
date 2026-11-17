@@ -164,8 +164,12 @@ def _alert_token_conflict(token: str, bot_id: int) -> None:
     last_alerts = state.get(str(bot_id), {})
     now = time.time()
     text = ("다른 컴퓨터나 이전 실행에서 같은 봇이 돌고 있는지 확인하세요.\n"
-            "그래도 모르는 사용이라면 BotFather에서 토큰을 재발급하고 "
-            "setup-telegram --manual 로 다시 연결하세요.")
+            "설치 도우미(@BizcardSetupBot)는 토큰을 저장하지 않습니다.\n"
+            "도우미는 명함 사진과 Google 계정에 접근하지 않습니다.\n"
+            "다만 Telegram 구조상 도우미 운영자는 내 봇의 토큰을 다시 조회할 수 있습니다.\n"
+            "토큰이 있으면 봇에 온 메시지를 읽을 수 있습니다.\n"
+            "이 점이 걸리거나 모르는 사용이 의심되면 BotFather에서 새 봇을 만들고 "
+            "python3 -m bizcard_intake setup-telegram --manual 로 연결하세요.")
     for chat_id in sorted(chat for chat in allowed_chat_ids() if chat > 0):
         last = last_alerts.get(str(chat_id))
         if isinstance(last, (int, float)) and now - last < TOKEN_ALERT_INTERVAL:

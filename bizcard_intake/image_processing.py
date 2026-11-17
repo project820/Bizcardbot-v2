@@ -24,7 +24,6 @@ import tempfile
 import threading
 from typing import Optional
 
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 VISION_RECTIFY_SOURCE = PROJECT_ROOT / "scripts" / "vision_rectify.swift"
 VISION_RECTIFY_BINARY = PROJECT_ROOT / ".cache" / "vision_rectify"
@@ -110,6 +109,11 @@ def prepare_card_images(
         (int(CANVAS_SIZE * CONTENT_FRAC), int(CANVAS_SIZE * CONTENT_FRAC)),
         Image.Resampling.LANCZOS,
     )
+    if rectified_path is not None:
+        try:
+            profile_image = _white_balance_profile(profile_image)
+        except Exception:
+            log.warning("profile paper whitening skipped")
 
     canvas = Image.new("RGB", (CANVAS_SIZE, CANVAS_SIZE), "white")
     x = (CANVAS_SIZE - profile_image.width) // 2
@@ -124,6 +128,52 @@ def prepare_card_images(
 def make_profile_image(source_path: Path, output_path: Path) -> Path:
     """Compatibility wrapper for tests and one-off scripts."""
     return prepare_card_images(source_path, output_path).profile_path
+
+
+def _white_balance_profile(image):
+    """Make light, moderately tinted paper look clean on the white canvas.
+
+    Estimate paper from the card, not the surrounding scene. Require a broad
+    low-saturation area so white lettering on colored stock is not a reference.
+    Per-channel LUTs keep black fixed and roll off highlights without clipping
+    logo colors; OCR and LLM images have already been saved independently.
+    """
+    import numpy as np
+    from PIL import Image
+
+    small = image.copy()
+    small.thumbnail((192, 192), Image.Resampling.BILINEAR)
+    pixels = np.asarray(small, dtype=np.float32).reshape(-1, 3)
+    peaks = pixels.max(axis=1)
+    saturation = (peaks - pixels.min(axis=1)) / np.maximum(peaks, 1)
+    candidates = pixels[saturation <= 0.32]
+    if len(candidates) < len(pixels) * 0.4:
+        return image
+    luminance = candidates[:, 0] * 0.2126 + candidates[:, 1] * 0.7152 + candidates[:, 2] * 0.0722
+    paper = np.median(candidates[luminance >= np.percentile(luminance, 80)], axis=0)
+    if paper[0] * 0.2126 + paper[1] * 0.7152 + paper[2] * 0.0722 < 140:
+        return image
+    ratios = paper / max(paper[1], 1)
+    if np.any(ratios < 0.72) or np.any(ratios > 1.3):
+        return image
+
+    # Neutralize 85% of the tint, then expose the green paper reference to 245.
+    neutral = 0.15 + 0.85 / ratios
+    # Reduce exposure together if one channel reaches the cap; independent
+    # clipping would leave dim warm paper yellower after correction.
+    exposure = min(245 / paper[1], 1.35 / np.max(neutral))
+    gains = np.clip(neutral * exposure, 0.8, 1.35)
+    gains = np.minimum(gains, 254 / np.maximum(paper, 1))
+    lut = []
+    for white, gain in zip(paper, gains):
+        for value in range(256):
+            mapped = value * gain
+            if gain > 1 and value > white:
+                # Preserve highlight differences instead of clipping at 255.
+                target = min(254, white * gain)
+                mapped = target + (value - white) * (255 - target) / max(255 - white, 1)
+            lut.append(round(min(254 if value < 255 else 255, mapped)))
+    return image.point(lut)
 
 
 def _crop_profile_edge_bleed(image):

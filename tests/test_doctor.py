@@ -1,3 +1,4 @@
+import builtins
 import json
 import unittest
 from unittest.mock import patch
@@ -7,6 +8,28 @@ from bizcard_intake.contacts import ContactSaveError
 
 
 class DoctorTest(unittest.TestCase):
+    def check_python_without(self, missing):
+        original_import = builtins.__import__
+
+        def import_module(name, *args, **kwargs):
+            if name == missing:
+                raise ModuleNotFoundError(name)
+            return original_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=import_module):
+            return doctor.check_python()
+
+    def test_missing_numpy_warns_without_failing(self):
+        check = self.check_python_without("numpy")
+        self.assertTrue(check.ok)
+        self.assertIn("경고", check.detail)
+        self.assertIn("종이색 보정", check.detail)
+
+    def test_missing_pillow_still_fails(self):
+        check = self.check_python_without("PIL")
+        self.assertFalse(check.ok)
+        self.assertIn("PIL", check.detail)
+
     def test_gws_check_states(self):
         with patch.object(doctor.shutil, "which", lambda name: None):
             self.assertFalse(doctor.check_gws().ok)

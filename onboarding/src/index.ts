@@ -14,7 +14,6 @@ interface Pairing {
   linkId?: string;
   botName?: string;
   suggestedUsername?: string;
-  requestId?: number;
   ownerId?: number;
   botId?: number;
   botUsername?: string;
@@ -58,8 +57,22 @@ async function constantTimeEqual(expected: string, supplied: string): Promise<bo
   const signature = await crypto.subtle.sign('HMAC', key, encoder.encode(expected));
   return crypto.subtle.verify('HMAC', key, signature, encoder.encode(supplied));
 }
+const CREATE_LABEL = '▶ 명함봇 만들기';
+class TelegramApiError extends Error {
+  constructor(method: string, status: number, errorCode: unknown, retryAfter: unknown) {
+    const numeric = (value: unknown): value is number => typeof value === 'number' && Number.isSafeInteger(value) && value >= 0;
+    super(`관리 봇 요청 실패: ${method} ${status}${numeric(errorCode) ? ` error_code=${errorCode}` : ''}${numeric(retryAfter) ? ` retry_after=${retryAfter}` : ''}`);
+    this.name = 'TelegramApiError';
+  }
+}
 class InputError extends Error {constructor(readonly status: number) {super('입력 오류');}}
 function failure(error: unknown): Response {
+  if (!(error instanceof InputError)) {
+    // Live-tail diagnostics only (persistent logs are disabled); never include tokens or IDs.
+    // Keep only the method, HTTP status and validated numbers; external text may embed secrets.
+    const detail = error instanceof TelegramApiError ? error.message : error instanceof TypeError ? 'TypeError' : error instanceof Error ? 'Error' : 'unknown';
+    console.error('relay-error', detail.slice(0, 200));
+  }
   return error instanceof InputError ? json({error:'요청 내용을 확인하세요.'},error.status) : json({error:'잠시 후 다시 시도하세요.'},503);
 }
 async function readJson(request: Request, maxBytes: number): Promise<Record<string, unknown>> {
@@ -141,7 +154,7 @@ export default {
 };
 
 export class PairingsObject {
-  constructor(private readonly state: DurableObjectState, private readonly env: Env, private readonly transport: Transport = fetch) {}
+  constructor(private readonly state: DurableObjectState, private readonly env: Env, private readonly transport: Transport = (input, init) => fetch(input, init)) {}
 
   async fetch(request: Request): Promise<Response> {
     // Even the trusted buffered envelope is parsed outside the serialized state gate.
@@ -175,7 +188,7 @@ export class PairingsObject {
     const alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789';
     const suffix = Array.from({length:6},()=>alphabet[randomInt(alphabet.length)]).join('');
     const pair: Pairing = {expiresAt:now+TTL,purgeAt:now+TTL+RECEIPT_TTL,status:'pending',linkId:id,botName:body.bot_name.trim(),
-      suggestedUsername:`bizcard_${suffix}_bot`,requestId:crypto.getRandomValues(new Int32Array(1))[0]};
+      suggestedUsername:`bizcard_${suffix}_bot`};
     await this.arm(pair.expiresAt);
     await this.state.storage.transaction(async tx=>{
       await tx.put(rateKey,rate);
@@ -233,10 +246,12 @@ export class PairingsObject {
 
   private async api(method: string, body: unknown): Promise<unknown> {
     const response = await this.transport(`https://api.telegram.org/bot${this.env.MANAGER_BOT_TOKEN}/${method}`, {
-      method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(5000),redirect:'error',
+      method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(body),signal:AbortSignal.timeout(5000),redirect:'manual',
     });
     const data: unknown = await response.json();
-    if (!response.ok || !record(data) || data.ok !== true) throw new Error('관리 봇 요청 실패');
+    if (!response.ok || !record(data) || data.ok !== true) throw new TelegramApiError(
+      method, response.status, record(data) ? data.error_code : undefined,
+      record(data) && record(data.parameters) ? data.parameters.retry_after : undefined);
     return data.result;
   }
 
@@ -246,6 +261,7 @@ export class PairingsObject {
       const id = typeof message.text === 'string' ? message.text.match(/^\/start(?:@[A-Za-z0-9_]+)? ([A-Za-z0-9_-]{1,64})$/)?.[1] : undefined;
       if (id) {await this.start(id,message.from.id); return;}
       if (message.managed_bot_created) {await this.managed(message.from,message.managed_bot_created.bot); return;}
+      if (message.text === CREATE_LABEL) {await this.fallback(message.from.id); return;}
     }
     if (update.managed_bot) await this.managed(update.managed_bot.user,update.managed_bot.bot,true);
   }
@@ -271,12 +287,24 @@ export class PairingsObject {
         await tx.put(key,pair); await tx.put(ownerKey,{pollHash:link.pollHash,expiresAt:pair.expiresAt});
       });
     }
-    await this.api('sendMessage',{chat_id:ownerId,text:'내 컴퓨터의 설치 화면에서 연 링크인지 확인하세요. 아래 버튼으로 명함봇을 만드세요. 링크 생성 후 10분 안에 설치를 마치세요.',reply_markup:{
-      resize_keyboard:true,keyboard:[[{text:'내 명함봇 만들기',request_managed_bot:{request_id:pair.requestId,suggested_name:pair.botName,suggested_username:pair.suggestedUsername}}]],
-    }});
-    await this.api('sendMessage',{chat_id:ownerId,text:'버튼이 보이지 않으면 텔레그램을 업데이트하거나 아래 링크를 누르세요.',reply_markup:{inline_keyboard:[[
-      {text:'버튼이 안 보이면 여기를 누르세요',url:`https://t.me/newbot/${this.env.MANAGER_BOT_USERNAME}/${pair.suggestedUsername}?name=${encodeURIComponent(pair.botName!)}`},
-    ]]}});
+    // The official creation link works on iOS, where the managed-bot keyboard button
+    // opened an empty chat picker. Keep the handle so update.managed_bot matches it.
+    await this.api('sendMessage',{chat_id:ownerId,
+      text:`설치 화면에서 연 링크가 맞으면 아래 ${CREATE_LABEL} 버튼을 누르고, 뜨는 화면에서 만들기를 누르세요. 봇 아이디는 바꾸지 마세요.`,
+      reply_markup:{inline_keyboard:[[this.createButton(pair)]]}});
+  }
+
+  private createButton(pair: Pairing): {text: string; url: string} {
+    return {text:CREATE_LABEL,url:`https://t.me/newbot/${this.env.MANAGER_BOT_USERNAME}/${pair.suggestedUsername}?name=${encodeURIComponent(pair.botName!)}`};
+  }
+
+  // Users who type the label get the official creation link again.
+  private async fallback(ownerId: number): Promise<void> {
+    const owner = await this.state.storage.get<Index>(`owner:${ownerId}`);
+    if (!owner || owner.expiresAt <= Date.now()) return;
+    const pair = await this.state.storage.get<Pairing>(`pair:${owner.pollHash}`);
+    if (!pair || pair.status !== 'started' || pair.ownerId !== ownerId) return;
+    await this.api('sendMessage',{chat_id:ownerId,text:'아래 버튼을 누르세요.',reply_markup:{inline_keyboard:[[this.createButton(pair)]]}});
   }
 
   private async managed(user: User | undefined, bot: User | undefined, requireSuggestedUsername = false): Promise<void> {

@@ -31,8 +31,10 @@ def check_python() -> Check:
             __import__(module)
         except Exception:
             missing.append(module)
-    if missing:
+    if "PIL" in missing:
         return Check("python", False, f"모듈 없음: {', '.join(missing)}", "pip install -r requirements.txt  (또는 BIZCARD_PYTHON으로 다른 인터프리터 지정)")
+    if "numpy" in missing:
+        return Check("python", True, "경고: numpy 없음: 연락처 사진의 종이색 보정이 꺼집니다. OpenCV 보정 폴백도 건너뜁니다. pip install -r requirements.txt로 설치하세요.")
     try:
         __import__("cv2")
     except Exception:

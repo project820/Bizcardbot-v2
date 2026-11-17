@@ -97,6 +97,10 @@ class TokenUseTests(unittest.TestCase):
             self.assertIn("모르는", text)
             self.assertIn("BotFather", text)
             self.assertIn("setup-telegram --manual", text)
+            self.assertIn("@BizcardSetupBot", text)
+            self.assertIn("토큰을 다시 조회", text)
+            self.assertIn("새 봇", text)
+            self.assertNotIn("재발급", text)
         self.assertEqual(self.calls.count("getWebhookInfo"), 4)
         self.assertEqual(self.calls.count("deleteWebhook"), 1)
 

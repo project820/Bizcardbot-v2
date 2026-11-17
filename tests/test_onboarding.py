@@ -177,7 +177,10 @@ class InstallerTests(unittest.TestCase):
                 self.assertEqual(method, "POST")
                 self.assertEqual(headers["Authorization"], f"Bearer {POLL_TOKEN}")
                 self.assertEqual(body, {"code": "123456"} if path.endswith("claim") else {})
-        self.assertIn("자동 연결은 설치 도우미 서버를 거칩니다. 원치 않으면 --manual", self.output.getvalue())
+        for notice in ("@BizcardSetupBot", "토큰을 다시 조회", "토큰을 저장하지 않습니다",
+                       "명함 사진과 Google 계정에 접근하지 않습니다", "--manual"):
+            self.assertIn(notice, self.output.getvalue())
+        self.assertNotIn("다시 발급", self.output.getvalue())
 
     def test_wrong_claim_code_reprompts_and_reports_remaining_attempts(self):
         self.service.claims.insert(0, (403, {"status": "bad_code", "attempts_left": 4}))
@@ -408,10 +411,59 @@ class InstallerTests(unittest.TestCase):
             with self.subTest(url=url), self.assertRaises(self.onboarding.SetupError):
                 self.onboarding.validate_base_url(url, allow_insecure_localhost=True)
 
-    def test_unconfigured_relay_enters_manual_without_requesting_placeholder(self):
-        self.assertEqual(self.run_setup(relay_url=None), 0)
+    def test_empty_relay_setting_enters_manual_without_network(self):
+        with patch.dict(os.environ, {"BIZCARD_ONBOARDING_URL": ""}):
+            self.assertEqual(self.run_setup(relay_url=None), 0)
         self.assertIn("수동", self.output.getvalue())
         self.assertFalse(any("pairings" in c[1] for c in self.service.calls))
+
+    def test_dotenv_empty_relay_enters_manual_without_pairing(self):
+        self.env.write_text('export BIZCARD_ONBOARDING_URL="" # manual\n')
+        with patch.object(self.onboarding, "_pair", side_effect=self.onboarding.RelayError("fallback")) as pair:
+            self.assertEqual(self.run_setup(relay_url=None), 0)
+        pair.assert_not_called()
+        self.assertIn("수동", self.output.getvalue())
+
+    def test_dotenv_relay_uses_safe_settings_parser(self):
+        self.env.write_text('export BIZCARD_ONBOARDING_URL="https://private.example/relay" # private\n')
+        with patch.object(self.onboarding, "_pair", side_effect=self.onboarding.RelayError("fallback")) as pair:
+            self.assertEqual(self.run_setup(relay_url=None), 0)
+        self.assertEqual(pair.call_args.args[0], "https://private.example/relay")
+
+    def test_process_relay_overrides_dotenv_including_empty_value(self):
+        for value in ("https://process.example", ""):
+            with self.subTest(value=value):
+                self.env.write_text("BIZCARD_ONBOARDING_URL=https://private.example\n")
+                with patch.dict(os.environ, {"BIZCARD_ONBOARDING_URL": value}), patch.object(
+                    self.onboarding, "_pair", side_effect=self.onboarding.RelayError("fallback")
+                ) as pair:
+                    self.assertEqual(self.run_setup(relay_url=None), 0)
+                if value:
+                    self.assertEqual(pair.call_args.args[0], value)
+                else:
+                    pair.assert_not_called()
+
+    def test_explicit_relay_overrides_process_and_dotenv(self):
+        self.env.write_text("BIZCARD_ONBOARDING_URL=https://private.example\n")
+        with patch.dict(os.environ, {"BIZCARD_ONBOARDING_URL": ""}):
+            self.assertEqual(self.run_setup(), 0)
+        self.assertTrue(any(c[1] == "/v1/pairings" for c in self.service.calls))
+
+    def test_invalid_dotenv_relay_fails_without_echoing_values(self):
+        self.env.write_text(f'BIZCARD_ONBOARDING_URL="{TOKEN}\n')
+        with patch.object(self.onboarding, "_pair", side_effect=self.onboarding.RelayError("fallback")) as pair:
+            self.assertEqual(self.run_setup(relay_url=None), 1)
+        pair.assert_not_called()
+        self.assertNotIn(TOKEN, self.output.getvalue())
+
+    def test_missing_process_and_dotenv_relay_uses_default(self):
+        for text in (None, "# no relay setting\n"):
+            with self.subTest(text=text):
+                if text is not None:
+                    self.env.write_text(text)
+                with patch.object(self.onboarding, "_pair", side_effect=self.onboarding.RelayError("fallback")) as pair:
+                    self.assertEqual(self.run_setup(relay_url=None, yes=True), 0)
+                self.assertEqual(pair.call_args.args[0], self.onboarding.DEFAULT_ONBOARDING_URL)
 
     def test_cosmetic_failures_warn_but_preserve_success_and_hide_errors(self):
         self.service.cosmetics_fail = True
@@ -534,6 +586,41 @@ class InstallerTests(unittest.TestCase):
         self.assertTrue(setup.call_args.kwargs["no_open"])
         self.assertTrue(setup.call_args.kwargs["yes"])
 
+    def test_default_relay_is_the_public_https_service(self):
+        self.assertEqual(self.onboarding.DEFAULT_ONBOARDING_URL,
+                         "https://bizcard-onboarding-relay.bizcardbot.workers.dev")
+        self.onboarding.validate_base_url(self.onboarding.DEFAULT_ONBOARDING_URL, allow_insecure_localhost=False)
+
+
+    def test_requests_send_a_named_user_agent(self):
+        captured = []
+
+        class Opener:
+            def open(self, request, timeout):
+                captured.append(request.get_header("User-agent"))
+                raise OSError("stop")
+
+        with patch.object(self.onboarding, "build_opener", return_value=Opener()):
+            with self.assertRaises(self.onboarding.SetupError):
+                self.onboarding._request_json("https://relay.example/v1/pairings", data={"bot_name": "x"})
+        self.assertEqual(captured, ["Bizcardbot-setup/" + __import__("bizcard_intake").__version__])
+        self.assertNotIn("Python-urllib", captured[0])
+
+    def test_transient_getme_failure_after_claim_is_retried(self):
+        real = self.onboarding._telegram
+        calls = {"getMe": 0}
+
+        def flaky(base, token, operation, data=None, **kwargs):
+            if operation == "getMe":
+                calls["getMe"] += 1
+                if calls["getMe"] == 1:
+                    raise self.onboarding.SetupError("temporary")
+            return real(base, token, operation, data, **kwargs)
+
+        with patch.object(self.onboarding, "_telegram", side_effect=flaky):
+            self.assertEqual(self.run_setup(), 0)
+        self.assertGreaterEqual(calls["getMe"], 2)
+        self.assertTrue(self.env.exists())
 
 if __name__ == "__main__":
     unittest.main()

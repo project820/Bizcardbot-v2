@@ -1,4 +1,8 @@
 import os
+import io
+from contextlib import redirect_stdout, redirect_stderr
+from pathlib import Path
+import tempfile
 import unittest
 from unittest.mock import patch
 
@@ -6,6 +10,13 @@ from bizcard_intake import cli, pipeline, telegram
 
 
 class BotStartupTest(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        root = patch.object(cli, "PROJECT_ROOT", Path(folder.name))
+        root.start()
+        self.addCleanup(root.stop)
+
     def test_bot_requires_telegram_token(self):
         with patch.dict(os.environ, {}, clear=True), patch.object(telegram, "main") as run:
             with self.assertRaisesRegex(SystemExit, "^TELEGRAM_BOT_TOKEN is required$"):
@@ -23,6 +34,95 @@ class BotStartupTest(unittest.TestCase):
                 ):
                     self.assertEqual(cli.main(argv), 0)
                 self.assertEqual(events, ["warm", "telegram"])
+
+
+class ProjectSettingsTest(unittest.TestCase):
+    def setUp(self):
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        self.root = Path(folder.name)
+        for context in (
+            patch.object(cli, "PROJECT_ROOT", self.root),
+            patch.dict(os.environ, {}, clear=True),
+            patch.object(telegram, "setup_logging"),
+            redirect_stdout(io.StringIO()),
+            redirect_stderr(io.StringIO()),
+        ):
+            context.__enter__()
+            self.addCleanup(context.__exit__, None, None, None)
+
+    def test_setup_and_doctor_read_saved_settings_with_process_precedence(self):
+        (self.root / ".env").write_text(
+            "TELEGRAM_BOT_TOKEN=synthetic-token\nTELEGRAM_ALLOWED_CHAT_IDS=123\n"
+            "OPENAI_API_KEY=synthetic-key\nBIZCARD_PARSER=openai\n"
+            "BIZCARD_OPENAI_MODEL=file-model\nBIZCARD_CROSSCHECK=auto\n",
+        )
+
+        def inspect_settings():
+            self.assertEqual(os.environ.get("TELEGRAM_BOT_TOKEN"), "synthetic-token")
+            self.assertEqual(os.environ.get("TELEGRAM_ALLOWED_CHAT_IDS"), "123")
+            self.assertEqual(os.environ.get("OPENAI_API_KEY"), "synthetic-key")
+            self.assertEqual(os.environ.get("BIZCARD_OPENAI_MODEL"), "process-model")
+            self.assertEqual(os.environ.get("BIZCARD_CROSSCHECK"), "")
+            self.assertEqual(cli.doctor.parser.backend_name(), "openai")
+            return [cli.doctor.Check("telegram", True, "synthetic settings loaded")]
+
+        for command in (cli.cmd_setup, cli.cmd_doctor):
+            with self.subTest(command=command.__name__), patch.dict(
+                os.environ, {"BIZCARD_OPENAI_MODEL": "process-model", "BIZCARD_CROSSCHECK": ""}, clear=True,
+            ), patch.object(cli.doctor, "run_checks", side_effect=inspect_settings):
+                self.assertEqual(command(), 0)
+
+    def test_other_cli_commands_load_settings_before_dispatch(self):
+        (self.root / ".env").write_text("BIZCARD_PARSER=claude\nTELEGRAM_BOT_TOKEN=synthetic-token\n")
+        commands = [
+            (["scan", "card.jpg"], "cmd_scan"),
+            (["save", "card-id"], "cmd_save"),
+            (["retry-pending"], "cmd_retry_pending"),
+            (["list"], "cmd_list"),
+            (["migrate-names"], "cmd_migrate_names"),
+            (["rollback-names", "backup.json"], "cmd_rollback_names"),
+        ]
+
+        def inspect_settings(*args):
+            self.assertEqual(os.environ.get("BIZCARD_PARSER"), "claude")
+            return 0
+
+        for argv, handler in commands:
+            with self.subTest(argv=argv), patch.dict(os.environ, {}, clear=True), patch.object(
+                cli, handler, side_effect=inspect_settings,
+            ):
+                self.assertEqual(cli.main(argv), 0)
+        for argv in ([], ["bot"]):
+            with self.subTest(argv=argv), patch.dict(os.environ, {}, clear=True), patch.object(
+                pipeline, "warm_up",
+            ), patch.object(telegram, "main", side_effect=inspect_settings):
+                self.assertEqual(cli.main(argv), 0)
+
+    def test_invalid_env_is_rejected_before_dispatch_without_echoing_value(self):
+        (self.root / ".env").write_text('OPENAI_API_KEY="synthetic-private-value\n')
+        for argv in (["scan", "card.jpg"], ["doctor"], ["setup"]):
+            with self.subTest(argv=argv), patch.object(cli, "cmd_scan") as scan, patch.object(
+                cli.doctor, "run_checks",
+            ) as checks, redirect_stderr(io.StringIO()) as errors:
+                self.assertEqual(cli.main(argv), 1)
+                self.assertNotIn("synthetic-private-value", errors.getvalue())
+                self.assertIn("Cannot read .env settings", errors.getvalue())
+                scan.assert_not_called()
+                checks.assert_not_called()
+
+    def test_shell_expressions_are_loaded_as_data(self):
+        marker = self.root / "must-not-exist"
+        value = f"$(touch {marker})"
+        (self.root / ".env").write_text(f"OPENAI_API_KEY='{value}'\n")
+
+        def inspect_settings():
+            self.assertEqual(os.environ.get("OPENAI_API_KEY"), value)
+            self.assertFalse(marker.exists())
+            return []
+
+        with patch.object(cli.doctor, "run_checks", side_effect=inspect_settings):
+            self.assertEqual(cli.cmd_doctor(), 0)
 
 
 class ShellStartupTest(unittest.TestCase):

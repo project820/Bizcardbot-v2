@@ -12,6 +12,7 @@ from pathlib import Path
 
 from . import cards, doctor, migrate_names, onboarding, pipeline, telegram
 from .contacts import LOGIN_COMMAND
+from .envfile import read_settings
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MANUAL_GWS_STEPS = """\
@@ -51,6 +52,10 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     command = args.command or "bot"
+    # Setup/doctor also support direct function calls; onboarding reads its own
+    # target file so freshly saved settings are not shadowed by stale values.
+    if command not in ("setup", "doctor", "setup-telegram") and not _load_project_settings():
+        return 1
     if command != "bot":
         telegram.setup_logging()
     if command == "bot":
@@ -160,7 +165,23 @@ def cmd_rollback_names(backup: Path) -> int:
     return 0
 
 
+def _load_project_settings() -> bool:
+    env_file = PROJECT_ROOT / ".env"
+    try:
+        settings = read_settings(env_file)
+    except FileNotFoundError:
+        return True
+    except (OSError, ValueError, UnicodeError):
+        print("Cannot read .env settings. Check assignment syntax and file permissions.", file=sys.stderr)
+        return False
+    for key, value in settings.items():
+        os.environ.setdefault(key, value)
+    return True
+
+
 def cmd_doctor() -> int:
+    if not _load_project_settings():
+        return 1
     checks = doctor.run_checks()
     print(doctor.format_report(checks))
     return 0 if all(c.ok for c in checks) else 1
@@ -172,6 +193,8 @@ def cmd_setup() -> int:
         shutil.copyfile(PROJECT_ROOT / ".env.example", env_file)
         print(f".env 생성: {env_file}  ->  TELEGRAM_BOT_TOKEN 등을 채운 뒤 다시 실행하세요.")
 
+    if not _load_project_settings():
+        return 1
     checks = doctor.run_checks()
     print(doctor.format_report(checks))
     failed = {c.name: c for c in checks if not c.ok}
