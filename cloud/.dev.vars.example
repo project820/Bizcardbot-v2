@@ -1,0 +1,14 @@
+# Template only. Copy to .dev.vars for an explicitly authorized real-service trial.
+# Do not copy the repository root .env or reuse the operating bot token.
+# Never commit .dev.vars. Use wrangler secret for any future remote trial.
+TELEGRAM_BOT_TOKEN=""
+TELEGRAM_WEBHOOK_SECRET=""
+ALLOWED_CHAT_IDS=""
+OPENAI_API_KEY=""
+GOOGLE_CLIENT_ID=""
+GOOGLE_CLIENT_SECRET=""
+GOOGLE_REFRESH_TOKEN=""
+DRY_RUN_SAVE="1"
+# DRY_RUN_SAVE suppresses Google only; LOCAL_MOCK suppresses ALL outbound API calls.
+LOCAL_MOCK="1"
+ENVIRONMENT="local"

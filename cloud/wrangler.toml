@@ -1,0 +1,45 @@
+name = "bizcard-cloud-poc"
+main = "src/index.ts"
+compatibility_date = "2026-11-17"
+workers_dev = false
+send_metrics = false
+
+[[durable_objects.bindings]]
+name = "JOBS"
+class_name = "JobObject"
+
+[[migrations]]
+tag = "v1-job-sqlite"
+new_sqlite_classes = ["JobObject"]
+
+[vars]
+ENVIRONMENT = "unconfigured"
+LOCAL_MOCK = "0"
+DRY_RUN_SAVE = "1"
+OPENAI_MODEL = "gpt-6-luna"
+KRW_PER_USD = "1335"
+MAX_COST_KRW = "2"
+INPUT_TOKEN_BUDGET = "8192"
+MAX_OUTPUT_TOKENS = "800"
+
+# Non-secret fixture sentinels only. All external operations use a closed mock transport.
+[env.local.vars]
+ENVIRONMENT = "local"
+LOCAL_MOCK = "1"
+DRY_RUN_SAVE = "1"
+TELEGRAM_BOT_TOKEN = "fixture-only"
+TELEGRAM_WEBHOOK_SECRET = "fixture-secret"
+ALLOWED_CHAT_IDS = "424242"
+OPENAI_API_KEY = "fixture-only"
+GOOGLE_CLIENT_ID = "fixture-only"
+GOOGLE_CLIENT_SECRET = "fixture-only"
+GOOGLE_REFRESH_TOKEN = "fixture-only"
+OPENAI_MODEL = "gpt-6-luna"
+KRW_PER_USD = "1335"
+MAX_COST_KRW = "2"
+INPUT_TOKEN_BUDGET = "8192"
+MAX_OUTPUT_TOKENS = "800"
+
+[[env.local.durable_objects.bindings]]
+name = "JOBS"
+class_name = "JobObject"

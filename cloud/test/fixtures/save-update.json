@@ -1,0 +1,1 @@
+{"update_id":900002,"callback_query":{"id":"fixture-callback","from":{"id":424242,"is_bot":false,"first_name":"PoC"},"chat_instance":"fixture-private-chat","message":{"message_id":11,"chat":{"id":424242,"type":"private"}},"data":"save:900001"}}

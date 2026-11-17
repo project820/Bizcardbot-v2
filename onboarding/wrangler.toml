@@ -1,0 +1,29 @@
+name = "bizcard-onboarding-relay"
+main = "src/index.ts"
+compatibility_date = "2026-11-17"
+workers_dev = false
+send_metrics = false
+preview_urls = false
+logpush = false
+
+[observability]
+enabled = false
+
+[observability.logs]
+enabled = false
+invocation_logs = false
+
+[observability.traces]
+enabled = false
+
+[[durable_objects.bindings]]
+name = "PAIRINGS"
+class_name = "PairingsObject"
+
+[[migrations]]
+tag = "v1-pairings-sqlite"
+new_sqlite_classes = ["PairingsObject"]
+
+[vars]
+MANAGER_BOT_USERNAME = "BizcardSetupBot"
+TELEGRAM_IP_CHECK = "1"

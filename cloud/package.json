@@ -1,0 +1,17 @@
+{
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261117.1",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0",
+    "wrangler": "^4.163.0"
+  },
+  "name": "bizcard-cloud-poc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit",
+    "dev": "wrangler dev --env local --ip 127.0.0.1 --port 8788"
+  }
+}

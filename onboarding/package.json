@@ -1,0 +1,16 @@
+{
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261117.1",
+    "typescript": "^7.0.2",
+    "vitest": "^5.1.0",
+    "wrangler": "^4.163.0"
+  },
+  "name": "bizcard-onboarding-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  }
+}
