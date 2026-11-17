@@ -44,6 +44,197 @@ _group_lock = threading.Lock()
 _group_pending: dict[tuple[int, str], int] = {}
 _group_summary_wanted: set[tuple[int, str]] = set()
 
+_note_drain_lock = threading.Lock()
+_note_notice_lock = threading.Lock()
+_automation_lock = threading.Lock()
+
+
+def export_buttons() -> dict:
+    return {"inline_keyboard": [[{"text": "CSV 내보내기", "callback_data": "ex"}]]}
+
+
+def register_commands(token: str) -> None:
+    try:
+        api_post(token, "setMyCommands", {"commands": [
+            {"command": "list", "description": "저장 안 된 명함"},
+            {"command": "help", "description": "사용법"},
+            {"command": "alerts", "description": "알림 설정"},
+            {"command": "export", "description": "명함 내보내기"},
+        ]})
+    except Exception:
+        log.warning("Telegram command registration failed; continuing polling")
+
+
+def send_export(token: str, chat_id: int) -> None:
+    if chat_id not in allowed_chat_ids():
+        return
+    try:
+        from . import export_csv, metrics
+        content, count = export_csv.build(chat_id)
+        if not count:
+            send_message(token, chat_id, "저장한 명함이 없습니다.")
+            return
+        if len(content) > 45 * 1024 * 1024:
+            send_message(token, chat_id, "CSV 파일이 45MB를 초과해 보낼 수 없습니다.")
+            return
+        summary = metrics.summary(chat_id)
+        parts = [f"저장한 명함 {count}건"]
+        rate = summary.get("unedited_rate")
+        cost = summary.get("avg_krw")
+        if rate is not None:
+            parts.append(f"수정 없이 저장 {rate:.0%}")
+        if cost is not None:
+            parts.append(f"평균 {cost:.1f}원")
+        filename = "bizcards-" + cards.followup_localtime(time.time()).strftime("%Y%m%d") + ".csv"
+        send_document(token, chat_id, content, filename, caption=" · ".join(parts))
+    except Exception:
+        log.warning("CSV export failed")
+        send_message(token, chat_id, "CSV 내보내기에 실패했습니다. 잠시 후 다시 눌러주세요.", reply_markup=export_buttons())
+
+
+def _note_buttons(*, check: bool = False) -> dict:
+    return {"inline_keyboard": [[{"text": "다시 확인" if check else "메모 권한 요청",
+                                  "callback_data": "nc" if check else "na"}]]}
+
+
+def _pending_notes(chat_id: int) -> int:
+    return sum(1 for card in cards.list_cards(chat_id, ["saved"])
+               if (card.get("note") or {}).get("state") == "pending"
+               and (card.get("resource_name") or "").startswith("apple:"))
+
+
+def maybe_note_notice(token: str, chat_id: int) -> None:
+    """Notice only this chat's pending cards; never request permission here."""
+    if chat_id not in allowed_chat_ids():
+        return
+    try:
+        from . import meeting_note
+        pending = _pending_notes(chat_id)
+        if not pending or meeting_note.status().get("automation") == "authorized":
+            return
+        with _note_notice_lock:
+            notices = cards.load_state("note_notices")
+            now = time.time()
+            last = notices.get(str(chat_id))
+            if last is not None and now - last < 24 * 3600:
+                return
+            send_message(token, chat_id,
+                         f"메모 {pending}건이 대기 중입니다. Mac mini 화면을 볼 수 있을 때 누르세요.",
+                         reply_markup=_note_buttons())
+            notices[str(chat_id)] = now
+            cards.save_state("note_notices", notices)
+            # A owns the state lock; its updater preserves concurrent permission results.
+            meeting_note._state(last_notice_at=now)
+    except ImportError:
+        pass
+    except Exception:
+        log.warning("meeting note notice failed")
+
+
+def _note_permission_result(token: str, chat_id: int, automation: str, pending: Optional[int] = None) -> None:
+    if automation == "authorized":
+        count = _pending_notes(chat_id) if pending is None else pending
+        send_message(token, chat_id, f"허용을 확인했습니다. 밀린 메모 {count}건을 추가합니다.")
+    elif automation == "denied":
+        send_message(token, chat_id, "시스템 설정 > 개인정보 보호 및 보안 > 자동화에서 Python 아래 '연락처'를 켜세요.",
+                     reply_markup=_note_buttons(check=True))
+    else:
+        send_message(token, chat_id, "메모 권한을 확인하지 못했습니다. Mac mini 화면을 확인한 뒤 다시 확인을 누르세요.",
+                     reply_markup=_note_buttons(check=True))
+
+
+def schedule_note_drain(token: str, check_chat_id: Optional[int] = None) -> None:
+    """At most one queued or running scan; Apple events run on the card pool."""
+    if not _note_drain_lock.acquire(blocking=False):
+        if check_chat_id is not None:
+            send_message(token, check_chat_id, "메모 권한을 확인 중입니다. 잠시 후 다시 확인하세요.",
+                         reply_markup=_note_buttons(check=True))
+        return
+
+    def drain() -> None:
+        try:
+            from . import meeting_note
+            pending = _pending_notes(check_chat_id) if check_chat_id is not None else None
+            result = meeting_note.drain()
+            if check_chat_id is not None:
+                _note_permission_result(token, check_chat_id, result.get("automation", "error"), pending)
+            for chat_id in allowed_chat_ids():
+                maybe_note_notice(token, chat_id)
+                _failed_note_notice(token, chat_id)
+        except ImportError:
+            pass
+        except Exception:
+            log.warning("meeting note drain failed")
+        finally:
+            _note_drain_lock.release()
+    try:
+        submit(drain)
+    except Exception:
+        _note_drain_lock.release()
+        log.warning("meeting note drain submission failed")
+
+
+def _failed_note_notice(token: str, chat_id: int) -> None:
+    with _note_notice_lock:
+        failed = [card for card in cards.list_cards(chat_id, ["saved"])
+                  if (card.get("note") or {}).get("state") == "failed"
+                  and card["note"].get("notice_pending")]
+        if not failed:
+            return
+        send_message(token, chat_id, f"메모 {len(failed)}건을 추가하지 못했습니다. 연락처는 저장되어 있습니다.")
+        for card in failed:
+            with pipeline.card_lock(card["id"]):
+                fresh = cards.load_card(card["id"])
+                if (fresh and fresh.get("status") == "saved"
+                        and (fresh.get("note") or {}).get("state") == "failed"
+                        and fresh["note"].get("notice_pending")):
+                    fresh["note"]["notice_pending"] = False
+                    cards.save_card(fresh)
+
+
+def request_note_permission(token: str, chat_id: int) -> None:
+    """Only an explicit na button may open the Mac automation prompt."""
+    if not _automation_lock.acquire(blocking=False):
+        send_message(token, chat_id, "메모 권한을 확인 중입니다. 잠시 후 다시 확인하세요.",
+                     reply_markup=_note_buttons(check=True))
+        return
+
+    def request() -> None:
+        try:
+            from . import meeting_note
+            result = meeting_note.request_automation()  # helper contract: at most 600 seconds
+            _note_permission_result(token, chat_id, result)
+            if result == "authorized":
+                schedule_note_drain(token)
+        except Exception:
+            log.warning("meeting note automation request failed")
+            _note_permission_result(token, chat_id, "error")
+        finally:
+            _automation_lock.release()
+    try:
+        send_message(token, chat_id, "Mac mini 화면의 창에서 '허용'을 누르세요. 10분 동안 기다립니다.")
+        threading.Thread(target=request, name="note-permission", daemon=True).start()
+    except Exception:
+        _automation_lock.release()
+        log.warning("meeting note automation thread failed")
+
+
+def _capture_caption(card: dict, caption: str) -> None:
+    group = card.get("media_group_id")
+    members = cards.group_cards(card["chat_id"], group) if group else [card]
+    shared = next((c.get("caption") for c in members if c.get("caption")), "") or caption.strip()[:300]
+    if not shared:
+        return
+    for member in members:
+        with pipeline.card_lock(member["id"]):
+            fresh = cards.load_card(member["id"])
+            if fresh and not fresh.get("caption"):
+                fresh["caption"] = shared
+                cards.save_card(fresh)
+            if fresh and member["id"] == card["id"]:
+                card.clear()
+                card.update(fresh)
+
 
 def worker_count() -> int:
     try:
@@ -204,6 +395,7 @@ def _run(token: str, data_dir: Path = DATA_DIR) -> None:
     if not allowed_chat_ids():
         raise SystemExit("TELEGRAM_ALLOWED_CHAT_IDS is required (comma-separated chat ids allowed to use the bot)")
     cards.initialize_followup()
+    register_commands(token)
     try:
         initialize_contacts(token)
     except Exception:
@@ -233,11 +425,13 @@ def _run(token: str, data_dir: Path = DATA_DIR) -> None:
         if time.monotonic() >= next_health_check:
             health_check(token)
             _safe_send_due_followups(token)
+            schedule_note_drain(token)
             next_health_check = time.monotonic() + HEALTH_CHECK_INTERVAL
             next_retry_scan = time.monotonic() + RETRY_SCAN_INTERVAL
         elif time.monotonic() >= next_retry_scan:
             retry_due_and_report(token)
             _safe_send_due_followups(token)
+            schedule_note_drain(token)
             next_retry_scan = time.monotonic() + RETRY_SCAN_INTERVAL
         try:
             updates = get_updates(token, offset)
@@ -514,6 +708,7 @@ def handle_photo(token: str, chat_id: int, message: dict, photos: list, data_dir
             if not fresh.get("awaiting_back"):
                 send_message(token, chat_id, "뒷면 사진을 이미 받았습니다. 최근 초안을 확인하세요.")
                 return None
+            _capture_caption(fresh, str(message.get("caption") or ""))
             fresh["awaiting_back"] = False
             cards.save_card(fresh)
         submit(process_back_photo, token, chat_id, photos, data_dir, fresh)
@@ -522,6 +717,7 @@ def handle_photo(token: str, chat_id: int, message: dict, photos: list, data_dir
     # album; image prep, OCR and the model calls run on the worker pool.
     group = (chat_id, str(media_group_id)) if media_group_id else None
     card = cards.new_card(chat_id, media_group_id=group[1] if group else None)
+    _capture_caption(card, str(message.get("caption") or ""))
     if group:
         _ensure_group_progress(token, group)
         submit(process_front_photo, token, chat_id, photos, data_dir, card, None, True, group=group)
@@ -722,6 +918,9 @@ def handle_text(token: str, chat_id: int, message: dict) -> None:
     if not text:
         send_message(token, chat_id, "명함 사진을 보내주세요.")
         return
+    if text.lower().split("@", 1)[0] == "/export":
+        submit(send_export, token, chat_id)
+        return
     if text.lower() in HELP_WORDS:
         send_message(token, chat_id, HELP_TEXT)
         return
@@ -759,7 +958,7 @@ def handle_text(token: str, chat_id: int, message: dict) -> None:
 def send_open_list(token: str, chat_id: int) -> None:
     open_cards = cards.list_cards(chat_id, cards.OPEN_STATUSES)
     if not open_cards:
-        send_message(token, chat_id, "저장 안 된 명함이 없습니다.")
+        send_message(token, chat_id, "저장 안 된 명함이 없습니다.", reply_markup=export_buttons())
         return
     text, markup = batch_summary(open_cards, "all", "저장 안 된 명함")
     edit_rows = [[{"text": f"{cards.label(card)} 직접 수정", "callback_data": f"ed:{card['id']}"}]
@@ -768,7 +967,9 @@ def send_open_list(token: str, chat_id: int) -> None:
         markup = {"inline_keyboard": (markup or {}).get("inline_keyboard", []) + edit_rows}
     if any(card["status"] in cards.REVIEW_STATUSES for card in open_cards):
         text += "\n\n검토 중이거나 저장 보류된 명함을 고치려면 해당 초안 메시지에 답장하세요."
+    markup = {"inline_keyboard": (markup or {}).get("inline_keyboard", []) + export_buttons()["inline_keyboard"]}
     send_message(token, chat_id, text, reply_markup=markup)
+    maybe_note_notice(token, chat_id)
     for card in open_cards:
         if card["status"] == "needs_confirmation":
             send_message(token, chat_id, f"{cards.label(card)} 저장 여부를 버튼으로 확인하세요.", reply_markup=saved_failed_buttons(card))
@@ -787,6 +988,16 @@ def handle_callback(token: str, callback: dict, chat_id: int) -> None:
     data = str(callback.get("data") or "")
     log.info("callback chat=%s data=%s", chat_id, data)
     action, _, rest = data.partition(":")
+    if action in ("na", "nc", "ex"):
+        if chat_id not in allowed_chat_ids():
+            return
+        if action == "na":
+            request_note_permission(token, chat_id)
+        elif action == "nc":
+            schedule_note_drain(token, check_chat_id=chat_id)
+        else:
+            submit(send_export, token, chat_id)
+        return
     if action in ("ae", "ad"):
         if chat_id not in allowed_chat_ids():
             return
@@ -930,6 +1141,8 @@ def approve_card(token: str, chat_id: int, card: dict, revision: Optional[int], 
     outcome = pipeline.approve(card, revision, job_choice=job_choice) if job_choice else pipeline.approve(card, revision)
     markup = None if outcome["ok"] or outcome.get("stale") else (draft_buttons(card) if outcome.get("invalid") else saved_failed_buttons(card))
     edit_message(token, chat_id, status_id, save_result_text(card, outcome), reply_markup=markup)
+    if outcome["ok"]:
+        maybe_note_notice(token, chat_id)
     return outcome
 
 
@@ -968,7 +1181,8 @@ def approve_batch(token: str, chat_id: int, scope: str) -> None:
         text += f"\n\n별도 확인이 필요한 {len(skipped)}건은 남겨두었습니다. 각 초안의 버튼을 눌러주세요."
     if ok < len(targets):
         text += "\n저장 보류된 명함은 자동으로 다시 시도합니다."
-    edit_message(token, chat_id, status_id, text)
+    edit_message(token, chat_id, status_id, text, reply_markup=export_buttons())
+    maybe_note_notice(token, chat_id)
     if scope.startswith("g:"):
         try:
             send_group_summary(token, chat_id, scope[2:])
@@ -1186,6 +1400,30 @@ def send_photo(token: str, chat_id: int, image_path: Path, caption: str = "", re
     result = with_retry(call, "Telegram sendPhoto")
     if result.get("ok") is not True:
         raise RuntimeError(result.get("description") or "Telegram sendPhoto failed")
+    return result
+
+
+def send_document(token: str, chat_id: int, content: bytes, filename: str,
+                  caption: str = "") -> dict:
+    _pace(chat_id)
+    boundary = f"----bizcard-{uuid.uuid4().hex}"
+    request = Request(
+        method_url(token, "sendDocument"),
+        data=b"".join([
+            _multipart_field(boundary, "chat_id", str(chat_id)),
+            _multipart_field(boundary, "caption", caption[:CAPTION_LIMIT]),
+            _multipart_file(boundary, "document", filename, "text/csv; charset=utf-8", content),
+            f"--{boundary}--\r\n".encode("utf-8"),
+        ]),
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    def call() -> dict:
+        with urlopen(request, timeout=60) as response:
+            return json.loads(response.read().decode("utf-8"))
+    result = with_retry(call, "Telegram sendDocument")
+    if result.get("ok") is not True:
+        raise RuntimeError("Telegram sendDocument failed")
     return result
 
 
