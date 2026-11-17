@@ -1,16 +1,22 @@
 # Bizcardbot-v2
 
-명함 사진을 Telegram으로 보내면 Google 연락처에 저장해 주는 봇이다.
+명함 사진을 Telegram으로 보내면 선택한 연락처 계정에 저장하는 봇이다.
 내 Mac에서 실행하고, 저장 전에 초안을 보여 준다.
-필요한 것은 켜 둔 Mac과 Google 계정, Telegram이다.
+필요한 것은 켜 둔 Mac과 Telegram이다.
+
 ChatGPT나 Claude 구독, 또는 별도 과금되는 OpenAI API 키도 필요하다.
-Google 연락처 저장에는 무료 `gws` CLI를 쓴다.
+Mac 연락처에서 Google 계정을 선택하면 Google Cloud 설정 없이 동기화한다.
+기존 무료 `gws` 직접 연결도 지원한다.
+
 처음 설치는 [Quick start](#quick-start)를 따른다.
 v1 사용자는 [업그레이드 방법](CHANGELOG.md)을 따른다.
 
-현재 버전: **2.0.0**
+현재 버전: **2.1.0**
 
 ## 새 소식 (What's new)
+
+- **v2.1.0**은 Mac 연락처 저장과 계정 선택을 추가한다.
+  `python3 -m bizcard_intake setup-contacts`로 연결 방식을 고른다.
 
 - **v2.0.0**은 새 저장소로 옮긴 첫 정식 버전이다.
 - 명함 방향을 자동으로 바로잡는다. 명함 17장을 네 방향으로 돌린 68건을 모두 바로잡았다.
@@ -33,7 +39,7 @@ v1 사용자는 [업그레이드 방법](CHANGELOG.md)을 따른다.
 photo ─▶ Apple Vision rectify + OCR ─▶ codex / claude (JSON) ─▶ draft in Telegram
                                                                     │ reply to fix, 승인 to save
                                                                     ▼
-                                                        Google Contacts (with card photo)
+                                                        Mac Contacts / Google Contacts (with card photo)
 ```
 
 ## Prerequisites
@@ -42,7 +48,7 @@ photo ─▶ Apple Vision rectify + OCR ─▶ codex / claude (JSON) ─▶ draf
 |---|---|---|
 | macOS with Xcode command line tools | Apple Vision does the card rectification and OCR | `xcode-select --install` |
 | Python 3.9+ with `numpy`, `Pillow` (`opencv-python` optional) | image preparation | `python3 -m pip install -r requirements.txt` |
-| [`gws`](https://github.com/googleworkspace/cli) logged in with the contacts scope | writes to Google Contacts | `brew install googleworkspace-cli` |
+| Optional: [`gws`](https://github.com/googleworkspace/cli), contacts scope | advanced Google direct backend only | `brew install googleworkspace-cli` |
 | **One of**: [`codex`](https://github.com/openai/codex) (ChatGPT Plus/Pro/Business) or [`claude`](https://docs.anthropic.com/en/docs/claude-code) (Claude subscription) | reads the card | `codex login` / `claude login` |
 | Telegram bot connection | the chat channel | `python3 -m bizcard_intake setup-telegram` |
 
@@ -67,7 +73,7 @@ Then, in order:
    The installer saves its token and your allowed chat ID in
    `.env` with owner-only permissions. Existing allowed chats are kept.
 2. Add `OPENAI_API_KEY=` to `.env` if you want the API parser.
-3. Run `python3 -m bizcard_intake setup` for Google login and parser checks.
+3. Run `python3 -m bizcard_intake setup` to choose a contacts backend and check the parser.
    CLI commands read the project's `.env` as data; process environment values take precedence.
 4. Start the bot: `./scripts/start_bot.sh`. The script reads `.env` automatically.
 
@@ -144,7 +150,77 @@ this can replay updates still retained by Telegram.
 Only listed chats can use the bot; everyone else gets a one-line refusal that
 shows their chat id, so adding more people later is easy.
 
-### Google login, once
+### 연락처 연결 선택
+
+```bash
+python3 -m bizcard_intake setup-contacts
+```
+
+1. **Mac 연락처 또는 Google 직접 연결을 고른다.**
+   Mac 연락처가 권장 경로다. gws와 Google Cloud 프로젝트가 필요 없다.
+2. **Mac의 연락처 접근 요청을 허용한다.**
+3. **저장할 계정 번호를 고른다.**
+   Mac에 등록된 연락처 계정을 선택한다.
+
+Google이 목록에 없으면 시스템 설정 > 인터넷 계정에서 Google을 추가한다.
+해당 계정의 연락처 동기화를 켠 뒤 `setup-contacts`를 다시 실행한다.
+
+Google 연락처와 사진의 서버 동기화는 macOS 계정 서비스가 담당한다.
+앱은 Mac 연락처에 저장한 필드를 다시 읽어 확인한다.
+Google 웹 연락처의 동기화 완료까지 확인하는 기능은 없다.
+
+`setup-contacts`는 `.env`에 아래 선택을 저장한다.
+
+```bash
+BIZCARD_CONTACTS_BACKEND=apple
+BIZCARD_APPLE_CONTAINER=  # chosen account identifier; empty = Mac default account
+```
+
+기존 사용자는 백엔드를 설정하지 않아도 gws 방식을 유지한다.
+직접 `python -m bizcard_intake`를 실행하면 프로세스 환경 변수가 `.env`보다 우선한다.
+`./scripts/start_bot.sh`는 `.env` 값을 export하므로 기존 환경 변수를 덮어쓴다.
+Google 직접 연결을 고르면 `BIZCARD_CONTACTS_BACKEND=google`을 저장한다.
+
+launchd 봇은 처음 실행할 때 연락처 접근을 다시 요청할 수 있다.
+요청 창에는 `python3` 또는 실제 Python 실행 파일 이름이 표시된다.
+
+거부했으면 시스템 설정 > 개인정보 보호 및 보안 > 연락처에서 Python을 허용한다.
+실행 경로나 책임 프로세스가 바뀌면 다시 허용해야 할 수 있다.
+부분 접근 권한은 지원하지 않으므로 전체 연락처 접근을 허용한다.
+
+**Mac 연락처의 메모 필드는 지원하지 않는다.**
+Apple의 `com.apple.developer.contacts.notes` entitlement가 필요하기 때문이다.
+사용자 메모와 검증 경고는 명함 초안에 남긴다.
+저장 결과에도 누락을 알리는 경고를 표시한다.
+
+Google 직접 연결은 기존 메모 저장을 유지한다.
+
+Mac 연락처는 생성과 갱신 전에 저장 작업을 명함 파일에 기록한다.
+작업에는 원래 계정과 대상 식별자, 최초 일치 식별자 집합을 보관한다.
+이름과 전체 전화번호·팩스·이메일도 대조 정보로 보관한다.
+설정을 바꿔도 진행 중인 작업과 사진 재시도는 원래 계정을 쓴다.
+
+생성 응답이 끊기면 최초 집합과 비교해 새 연락처 한 건을 채택한다.
+최초 식별자가 사라졌거나 새 후보가 없거나 여러 건이면 확인을 요청한다.
+조회에서 연락처가 보이지 않아도 자동으로 다시 생성하지 않는다.
+갱신은 원래 대상에 값을 추가하며 기존 이름·조직 정보와 목록 값을 보존한다.
+갱신 대상 식별자가 바뀌면 같은 계정의 대조 정보로 한 건을 찾는다.
+대상을 확정하지 못하면 생성으로 전환하지 않고 확인을 요청한다.
+
+Telegram의 **이미 저장됨 / 다시 저장 / 건너뛰기** 버튼으로 선택한다.
+이미 저장됨을 선택하면 추가 저장과 사진 업로드를 생략한다.
+다시 저장을 선택하면 원래 계정에서 새 저장 작업을 시작한다.
+다시 저장 결과에도 사진 실패와 메모 누락, 필드 검증 경고를 표시한다.
+저장 중에는 수정·뒷면 추가·인식 재시도 버튼으로 명함을 변경하지 않는다.
+저장 결과를 명함 파일에 기록한 뒤 원본 이미지를 정리한다.
+목록은 저장 중인 명함을 `저장 중`으로 표시한다.
+새 확인 단계에서는 이전 버튼을 사용할 수 없다.
+기존 v2.0.0 명함에는 새 작업 기록이 없어도 기존 Google 저장을 유지한다.
+Mac 권한 알림은 같은 상태에서 24시간마다 재알림한다.
+마지막 알림을 로컬에 보관하므로 봇 재시작으로 반복하지 않는다.
+Google 점검 알림은 `BIZCARD_ALERT_CHAT_ID`가 있을 때만 보낸다.
+
+### Google login, once (advanced gws backend)
 
 ```bash
 GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND=file gws auth login --scopes https://www.googleapis.com/auth/contacts
@@ -305,7 +381,10 @@ tail -f data/logs/bot.log
 
 `KeepAlive` is unconditional: the bot comes back after crashes, reboots and
 manual stops. At startup and every 24 hours it re-checks codex/claude and the
-Google token and alerts `BIZCARD_ALERT_CHAT_ID` on failure.
+selected contacts backend and alerts `BIZCARD_ALERT_CHAT_ID` on failure.
+When that setting is empty, only Apple Contacts permission alerts go to the
+allowed chats. Google backend checks and other health alerts require
+`BIZCARD_ALERT_CHAT_ID`.
 
 ## CLI
 
@@ -313,6 +392,7 @@ Google token and alerts `BIZCARD_ALERT_CHAT_ID` on failure.
 python3 -m bizcard_intake doctor              # environment report
 python3 -m bizcard_intake setup               # guided fixes
 python3 -m bizcard_intake setup-telegram      # create/connect a Telegram bot
+python3 -m bizcard_intake setup-contacts      # choose a Mac account or gws
 python3 -m bizcard_intake scan card.jpg       # parse one image locally, print the draft
 python3 -m bizcard_intake save <card-id>
 python3 -m bizcard_intake retry-pending     # retry saves on hold now
@@ -358,7 +438,8 @@ Card photos arrive through Telegram, and drafts with preview images go back to
 the same chat before you approve them. Card images and OCR text are sent to
 the model provider you use: the OpenAI API or Codex CLI, and Anthropic (Claude
 Haiku API for the cross-check, or the Claude Code CLI). The parsed fields and
-card photo go to your Google Contacts. Nothing else leaves the machine. Card
+card photo go to the selected contacts account (Mac Contacts or Google directly).
+Mac account services sync a Google or iCloud container to that provider. Nothing else leaves the machine. Card
 records, logs and images stay locally in `data/`, which is git-ignored; the
 local card images are deleted after a successful save (the profile image is kept
 until a failed photo upload succeeds on retry).
