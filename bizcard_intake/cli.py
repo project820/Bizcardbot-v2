@@ -10,7 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import cards, doctor, migrate_names, onboarding, pipeline, telegram
+from . import apple_contacts, cards, doctor, migrate_names, onboarding, pipeline, telegram
+from .contacts import ContactSaveError
 from .contacts import LOGIN_COMMAND
 from .envfile import read_settings
 
@@ -28,12 +29,12 @@ gcloud가 없어 수동 설정이 필요합니다 (한 번만):
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(prog="bizcard", description="Business card -> Google Contacts")
+    parser = argparse.ArgumentParser(prog="bizcard", description="Business card -> Contacts")
     sub = parser.add_subparsers(dest="command")
     sub.add_parser("bot", help="Telegram 봇 실행 (기본)")
     scan = sub.add_parser("scan", help="이미지 하나를 파싱해 초안 출력 (로컬 점검용)")
     scan.add_argument("image", type=Path)
-    save = sub.add_parser("save", help="명함 ID(또는 예전 세션 JSON)를 Google Contacts에 저장")
+    save = sub.add_parser("save", help="명함 ID(또는 예전 세션 JSON)를 선택한 연락처 계정에 저장")
     save.add_argument("session", type=Path)
     sub.add_parser("retry-pending", help="저장 보류된 명함 즉시 재시도")
     sub.add_parser("list", help="저장 안 된 명함 목록")
@@ -45,6 +46,7 @@ def main(argv: list[str] | None = None) -> int:
     rollback.add_argument("backup", type=Path)
     sub.add_parser("doctor", help="준비 상태 점검")
     sub.add_parser("setup", help="준비 상태 점검 후 부족한 항목 안내/설정")
+    sub.add_parser("setup-contacts", help="Mac 연락처 또는 Google 직접 연결 선택")
     setup_telegram = sub.add_parser("setup-telegram", help="Telegram 봇 만들기와 연결 설정")
     setup_telegram.add_argument("--manual", action="store_true", help="BotFather 수동 설정")
     setup_telegram.add_argument("--no-open", action="store_true", help="Telegram 링크 자동 열기 생략")
@@ -54,7 +56,7 @@ def main(argv: list[str] | None = None) -> int:
     command = args.command or "bot"
     # Setup/doctor also support direct function calls; onboarding reads its own
     # target file so freshly saved settings are not shadowed by stale values.
-    if command not in ("setup", "doctor", "setup-telegram") and not _load_project_settings():
+    if command not in ("setup", "doctor", "setup-telegram", "setup-contacts") and not _load_project_settings():
         return 1
     if command != "bot":
         telegram.setup_logging()
@@ -84,6 +86,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_doctor()
     if command == "setup":
         return cmd_setup()
+    if command == "setup-contacts":
+        return cmd_setup_contacts()
     if command == "setup-telegram":
         return onboarding.setup_telegram(env_path=PROJECT_ROOT / ".env", manual=args.manual,
                                          no_open=args.no_open, yes=args.yes)
@@ -195,6 +199,11 @@ def cmd_setup() -> int:
 
     if not _load_project_settings():
         return 1
+    if not os.environ.get("BIZCARD_CONTACTS_BACKEND", "").strip():
+        if cmd_setup_contacts() != 0:
+            return 1
+        if not _load_project_settings():
+            return 1
     checks = doctor.run_checks()
     print(doctor.format_report(checks))
     failed = {c.name: c for c in checks if not c.ok}
@@ -207,11 +216,13 @@ def cmd_setup() -> int:
         print("\n--- Google 로그인 ---")
         if shutil.which("gcloud"):
             if ask("gcloud가 있습니다. gws auth setup --login 으로 프로젝트/OAuth 클라이언트를 자동 생성할까요?"):
-                subprocess.run(["gws", "auth", "setup", "--login"], check=False)
+                subprocess.run(["gws", "auth", "setup", "--login"], check=False,
+                               env={**os.environ, "GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND": "file"})
         elif not (Path.home() / ".config" / "gws" / "client_secret.json").exists():
             print(MANUAL_GWS_STEPS)
         if ask(f"지금 로그인할까요? ({LOGIN_COMMAND})"):
-            subprocess.run(LOGIN_COMMAND.split(), check=False)
+            subprocess.run(LOGIN_COMMAND.split(), check=False,
+                           env={**os.environ, "GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND": "file"})
         print("개인 Gmail(외부 앱)이라면 콘솔에서 앱을 '프로덕션'으로 게시했는지 확인하세요. 테스트 상태는 7일마다 로그인이 풀립니다.")
 
     parser_check = failed.get("parser")
@@ -221,6 +232,62 @@ def cmd_setup() -> int:
         print(f"  {parser_check.fix}")
 
     print("\n남은 항목을 해결한 뒤 `python -m bizcard_intake doctor` 로 다시 확인하세요.")
+    return 1
+
+
+def cmd_setup_contacts() -> int:
+    """Choose a destination without changing process-environment precedence."""
+    path = PROJECT_ROOT / ".env"
+    try:
+        if path.exists():
+            read_settings(path)  # Fail before any permission request for malformed files.
+        print("명함을 저장할 연락처 연결을 선택하세요.")
+        print("1. Mac 연락처(추천: Google·iCloud 계정 선택, Google Cloud 설정 불필요)")
+        print("2. Google 직접 연결(gws, 고급)")
+        choice = input("번호 [1]: ").strip() or "1"
+        if choice == "2":
+            settings = {"BIZCARD_CONTACTS_BACKEND": "google", "BIZCARD_APPLE_CONTAINER": ""}
+            onboarding.save_settings(path, settings)
+            print("Google 직접 연결을 저장했습니다. `python -m bizcard_intake setup`에서 gws 로그인을 완료하세요.")
+        elif choice == "1":
+            print("Mac의 연락처 접근 요청을 허용하세요.")
+            print("launchd 봇의 첫 실행 때 'python3' 연락처 접근 요청이 한 번 더 표시됩니다.")
+            status = apple_contacts.run_helper("request").get("status")
+            if status != "authorized":
+                print(apple_contacts.AUTH_MESSAGE)
+                return 1
+            result = apple_contacts.run_helper("containers")
+            containers = result.get("containers", [])
+            if not any("google" in item["name"].lower() for item in containers):
+                print("Google 계정이 없습니다. 시스템 설정 > 인터넷 계정에서 Google을 추가하고 연락처를 켜세요.")
+                print("지금은 아래 iCloud 또는 이 Mac 계정을 선택해도 됩니다. 추가 후 setup-contacts로 다시 선택하세요.")
+            if not containers:
+                print("저장 가능한 연락처 계정이 없습니다. 인터넷 계정을 설정한 뒤 다시 실행하세요.")
+                return 1
+            for index, item in enumerate(containers, 1):
+                name = "이 Mac" if item.get("type") == 1 else item["name"]
+                print(f"{index}. {name}")
+            selected = input("저장할 계정 번호: ").strip()
+            if not selected.isdigit() or not 1 <= int(selected) <= len(containers):
+                print("목록에 있는 계정 번호를 입력하세요. 설정을 저장하지 않았습니다.")
+                return 1
+            container = containers[int(selected) - 1]
+            settings = {"BIZCARD_CONTACTS_BACKEND": "apple", "BIZCARD_APPLE_CONTAINER": container["id"]}
+            onboarding.save_settings(path, settings)
+            print(f"Mac 연락처({container['name']})를 저장했습니다.")
+            print("Mac 연락처에는 메모·검증 경고를 저장할 수 없습니다. 명함 초안에서 확인하세요.")
+        else:
+            print("1 또는 2를 입력하세요. 설정을 저장하지 않았습니다.")
+            return 1
+        if any(key in os.environ and os.environ[key] != value for key, value in settings.items()):
+            print("현재 프로세스의 환경 변수가 .env보다 우선합니다. 다음 봇 실행에도 환경 변수를 확인하세요.")
+        return 0
+    except ContactSaveError as exc:
+        print(str(exc), file=sys.stderr)
+    except (OSError, ValueError, UnicodeError, onboarding.SetupError):
+        print("연락처 설정을 저장하지 못했습니다. .env 형식과 파일 권한을 확인하세요.", file=sys.stderr)
+    except (EOFError, KeyboardInterrupt):
+        print("연락처 설정을 취소했습니다.")
     return 1
 
 

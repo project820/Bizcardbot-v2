@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import os
 import re
 import subprocess
 import threading
@@ -451,7 +452,8 @@ def update_contact(existing: dict[str, Any], draft: CardDraft) -> dict[str, Any]
 
 def run_gws(args: list[str], allow_failure: bool = False, expect_json: bool = True, mutating: bool = False) -> dict[str, Any]:
     try:
-        completed = subprocess.run(["gws", *args], check=False, capture_output=True, text=True, timeout=GWS_TIMEOUT)
+        completed = subprocess.run(["gws", *args], check=False, capture_output=True, text=True, timeout=GWS_TIMEOUT,
+                                   env={**os.environ, "GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND": "file"})
     except FileNotFoundError:
         raise ContactSaveError("gws CLI를 찾을 수 없습니다. brew install googleworkspace-cli", kind="other")
     except subprocess.TimeoutExpired:
@@ -560,7 +562,8 @@ def _short(text: str, limit: int = 120) -> str:
 def gws_auth_status() -> dict[str, Any]:
     """Result of `gws auth status` (empty dict when gws is missing or broken)."""
     try:
-        completed = subprocess.run(["gws", "auth", "status"], capture_output=True, text=True, timeout=30)
+        completed = subprocess.run(["gws", "auth", "status"], capture_output=True, text=True, timeout=30,
+                                   env={**os.environ, "GOOGLE_WORKSPACE_CLI_KEYRING_BACKEND": "file"})
         return json.loads(completed.stdout) if completed.stdout.strip() else {}
     except Exception as exc:  # FileNotFoundError, timeout, JSON errors
         return {"token_error": str(exc)}

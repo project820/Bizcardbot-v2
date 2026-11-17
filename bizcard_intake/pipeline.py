@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 import threading
 import tempfile
 import time
@@ -18,8 +19,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Optional
 
-from . import cards
-from .contacts import ContactSaveError, SaveResult, save_contact, upload_photo
+from . import cards, apple_contacts, contact_backend
+from .contact_backend import ContactSaveError, SaveResult, save_contact, upload_photo, refresh_resource_name
 from .draft import CardDraft, apply_edits, parse_edits, preserve_locked
 from .image_processing import PreparedImages, prepare_card_images as _prepare_card_images
 from .parser import merge_drafts, parse_card, revise_draft
@@ -121,12 +122,16 @@ _card_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
 
 
 @contextmanager
-def card_lock(card_id: str):
+def card_lock(card_id: str, *, blocking: bool = True):
     """Serialize saves, edits and cancellation for a card across channel workers."""
     with _locks_guard:
         lock = _card_locks[card_id]
-    with lock:
-        yield
+    acquired = lock.acquire(blocking=blocking)
+    try:
+        yield acquired
+    finally:
+        if acquired:
+            lock.release()
 
 
 def profile_image_path(source_path: Path) -> Path:
@@ -291,7 +296,26 @@ def _approve_locked(card: dict, revision: Optional[int]) -> dict:
     return _save(card)
 
 
-def _save(card: dict) -> dict:
+def _persist_save_fields(card: dict, *fields: str, event: str = "", detail: str = "") -> None:
+    """Merge worker-owned fields into fresh state while the caller holds card_lock.
+
+    Keep UI metadata and its current Apple version; never copy a stale card over
+    the journal. The normal save_card operation/nonce guards still apply.
+    """
+    fresh = cards.load_card(card["id"]) or dict(card)
+    for field in fields:
+        if field in card:
+            fresh[field] = card[field]
+        else:
+            fresh.pop(field, None)
+    if event:
+        cards.add_history(fresh, event, detail)
+    cards.save_card(fresh)
+    card.clear()
+    card.update(fresh)
+
+
+def _save(card: dict, *, new_operation: bool = False) -> dict:
     draft = current_draft(card)
     card["status"] = "saving"
     card["save_attempts"] = int(card.get("save_attempts") or 0) + 1
@@ -300,11 +324,40 @@ def _save(card: dict) -> dict:
     def checkpoint(resource_name: str, action: str) -> None:
         card["resource_name"] = resource_name
         card["save_action"] = card.get("save_action") or action
-        cards.add_history(card, "contact_written", f"{action} {resource_name}")
-        cards.save_card(card)
+        _persist_save_fields(card, "resource_name", "save_action",
+                             event="contact_written", detail=f"{action} {resource_name}")
+
+    def intent_checkpoint(intent: dict) -> None:
+        if card.get("save_intent") and not new_operation:
+            raise RuntimeError("Unresolved save operation cannot be replaced")
+        card["save_intent"] = intent
+        card["resource_name"] = None
+        card.pop("save_resolution", None)
+        _persist_save_fields(card, "save_intent", "resource_name", "save_resolution")
 
     try:
-        result: SaveResult = save_contact(draft, card["images"].get("profile"), resource_name=card.get("resource_name"), checkpoint=checkpoint)
+        kwargs = {}
+        intent = card.get("save_intent")
+        if not intent and not card.get("resource_name") and card.get("error_kind") == "unknown_outcome" and contact_backend.backend_name() == "apple":
+            selected = apple_contacts.container_id() or apple_contacts.run_helper("containers").get("defaultIdentifier", "")
+            if not selected:
+                raise ContactSaveError("저장할 Mac 연락처 계정을 확인하지 못했습니다.", kind="invalid")
+            intent_checkpoint({"op": "create", "backend": "apple", "container": selected,
+                               "target_identifier": None, "fingerprint": apple_contacts.fingerprint(draft),
+                               "identifiers": [], "generation": 1, "legacy_untracked": True})
+            raise apple_contacts.ConfirmationRequired()
+        if (intent and intent.get("backend") == "apple") or (
+                (card.get("resource_name") or "").startswith("apple:") or (
+                not card.get("resource_name") and contact_backend.backend_name() == "apple")):
+            kwargs = {"save_intent": intent, "intent_checkpoint": intent_checkpoint}
+            if new_operation:
+                kwargs["new_operation"] = True
+        result: SaveResult = save_contact(draft, card["images"].get("profile"), resource_name=card.get("resource_name"), checkpoint=checkpoint, **kwargs)
+    except apple_contacts.ConfirmationRequired as exc:
+        card.update(status="needs_confirmation", last_error=str(exc), error_kind="unknown_outcome",
+                    next_retry_at=None, confirmation_id=secrets.token_hex(8))
+        _persist_save_fields(card, "status", "last_error", "error_kind", "next_retry_at", "confirmation_id")
+        return {"ok": False, "needs_confirmation": True, "message": str(exc)}
     except ContactSaveError as exc:
         return _save_failed(card, str(exc), getattr(exc, "kind", "other"), getattr(exc, "retryable", False))
     except Exception as exc:  # unexpected adapter failure: keep the card, retry later
@@ -319,13 +372,56 @@ def _save(card: dict) -> dict:
     card["error_kind"] = None
     card["next_retry_at"] = None
     card["save_warnings"] = list(result.warnings)
-    cards.add_history(card, "saved", result.summary)
+    _persist_save_fields(card, "status", "resource_name", "save_action", "photo_status",
+                         "last_error", "error_kind", "next_retry_at", "save_warnings",
+                         event="saved", detail=result.summary)
+    # A crash during cleanup must leave a durable terminal state, never saving.
     keep = {"profile"} if result.photo == "failed" else set()
     cleanup_card_images(card, keep=keep)
-    cards.save_card(card)
+    _persist_save_fields(card, "images")
     archive_saved(card, result.summary)
     log.info("saved card=%s %s photo=%s", card["id"], card["resource_name"], result.photo)
     return {"ok": True, "result": result, "message": result.summary, "warnings": list(result.warnings), "photo": result.photo}
+
+
+def confirmation_token(card: dict) -> str:
+    """Migrate old confirmation cards under the same lock used by consumption."""
+    with card_lock(card["id"]):
+        fresh = cards.load_card(card["id"]) or card
+        if fresh.get("status") != "needs_confirmation":
+            return ""
+        if not fresh.get("confirmation_id"):
+            fresh["confirmation_id"] = secrets.token_hex(8)
+            cards.save_card(fresh)
+        card.update(fresh)
+        return fresh["confirmation_id"]
+
+
+def resolve_confirmation(card: dict, choice: str, confirmation_id: str) -> dict:
+    with card_lock(card["id"]):
+        fresh = cards.load_card(card["id"])
+        if (not fresh or fresh.get("status") != "needs_confirmation" or not confirmation_id
+                or fresh.get("confirmation_id") != confirmation_id):
+            return {"ok": False, "stale": True, "message": "이미 처리됨"}
+        if choice not in ("again", "saved", "skip"):
+            return {"ok": False, "message": "확인 버튼을 다시 선택하세요."}
+        card.clear()
+        card.update(fresh)
+        # Consume durably before a lookup, write, or slow external operation.
+        # A crash after consumption leaves the old operation for read-only recovery.
+        card.update(confirmation_id=None, save_resolution=choice, next_retry_at=None)
+        if choice == "again":
+            card.update(status="saving", error_kind=None, last_error=None)
+            cards.add_history(card, "confirmed_recreate")
+            cards.save_card(card)
+            return _save(card, new_operation=True)
+        card.update(status="saved" if choice == "saved" else "cancelled",
+                    photo_status="skipped", last_error=None, error_kind=None)
+        cards.add_history(card, "confirmed_" + choice)
+        cards.save_card(card)
+        cleanup_card_images(card)
+        cards.save_card(card)
+        return {"ok": True, "message": "이미 저장됨으로 확인했습니다." if choice == "saved" else "이 명함을 건너뛰었습니다."}
 
 
 def _save_failed(card: dict, message: str, kind: str, retryable: bool) -> dict:
@@ -339,8 +435,8 @@ def _save_failed(card: dict, message: str, kind: str, retryable: bool) -> dict:
     else:
         delay = min(RETRY_BASE_SECONDS * (2 ** max(0, int(card.get("save_attempts") or 1) - 1)), RETRY_MAX_SECONDS)
         card["next_retry_at"] = time.time() + delay
-    cards.add_history(card, "save_failed", f"{kind}: {message}")
-    cards.save_card(card)
+    _persist_save_fields(card, "status", "last_error", "error_kind", "next_retry_at",
+                         event="save_failed", detail=f"{kind}: {message}")
     log.warning("save failed card=%s kind=%s: %s", card["id"], kind, message)
     return {"ok": False, "kind": kind, "retryable": kind != "invalid", "message": message}
 
@@ -370,19 +466,30 @@ def retry_due(force: bool = False, on_result: Optional[Callable[[dict, dict], No
     for card in cards.list_cards(statuses=["saved"]):
         if card.get("photo_status") != "failed" or not card.get("resource_name"):
             continue
-        path = card["images"].get("profile")
-        if not path or not Path(path).exists():
-            card["photo_status"] = "missing"
-            cards.save_card(card)
-            continue
-        try:
-            upload_photo(card["resource_name"], path)
-        except ContactSaveError as exc:
-            log.warning("photo retry failed card=%s: %s", card["id"], exc)
-            continue
-        card["photo_status"] = "uploaded"
-        cleanup_card_images(card)
-        cards.save_card(card)
+        with card_lock(card["id"]):
+            card = cards.load_card(card["id"])
+            if not card or card.get("status") != "saved" or card.get("photo_status") != "failed" or not card.get("resource_name"):
+                continue
+            path = card["images"].get("profile")
+            if not path or not Path(path).exists():
+                card["photo_status"] = "missing"
+                _persist_save_fields(card, "photo_status")
+                continue
+            try:
+                if card["resource_name"].startswith("apple:"):
+                    card["resource_name"] = refresh_resource_name(card["resource_name"], current_draft(card), card.get("save_intent"))
+                    _persist_save_fields(card, "resource_name")
+                if card.get("save_intent", {}).get("backend") == "apple":
+                    upload_photo(card["resource_name"], path, save_intent=card["save_intent"])
+                else:
+                    upload_photo(card["resource_name"], path)
+            except ContactSaveError as exc:
+                log.warning("photo retry failed card=%s: %s", card["id"], exc)
+                continue
+            card["photo_status"] = "uploaded"
+            _persist_save_fields(card, "photo_status")
+            cleanup_card_images(card)
+            _persist_save_fields(card, "images")
     return saved, failures
 
 
@@ -397,6 +504,7 @@ def cancel(card: dict) -> bool:
         card["status"] = "cancelled"
         card["awaiting_back"] = False
         cards.add_history(card, "cancelled")
+        cards.save_card(card)
         cleanup_card_images(card)
         cards.save_card(card)
         return True

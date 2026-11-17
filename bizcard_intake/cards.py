@@ -21,13 +21,16 @@ import secrets
 import tempfile
 import threading
 import time
+from collections import defaultdict
 from pathlib import Path
 from typing import Iterable, Optional
 
 CARD_DIR = Path("data/cards")
-OPEN_STATUSES = ("processing", "review", "saving", "save_failed")
+OPEN_STATUSES = ("processing", "review", "saving", "save_failed", "needs_confirmation")
 REVIEW_STATUSES = ("review", "save_failed")
 _seq_lock = threading.Lock()
+_write_locks_guard = threading.Lock()
+_write_locks: dict[str, threading.Lock] = defaultdict(threading.Lock)
 
 
 def now() -> str:
@@ -75,9 +78,32 @@ def card_path(card_id: str) -> Path:
 
 
 def save_card(card: dict) -> None:
-    card["updated_at"] = now()
-    CARD_DIR.mkdir(parents=True, exist_ok=True)
-    _atomic_write(card_path(card["id"]), json.dumps(card, ensure_ascii=False, indent=2))
+    # Channel callbacks can hold a pre-save copy while a worker writes Contacts.
+    # Apple journals and consumed nonces must survive those delayed UI writes.
+    with _write_locks_guard:
+        lock = _write_locks[card["id"]]
+    with lock:
+        stored = load_card(card["id"]) or {}
+        before, after = stored.get("save_intent"), card.get("save_intent")
+        apple = any(intent and intent.get("backend") == "apple" for intent in (before, after))
+        version = stored.get("_apple_state_version", 0)
+        if apple:
+            if card.get("_apple_state_version", 0) != version:
+                raise RuntimeError("Stale Apple card state cannot overwrite a save operation")
+            if before and before != after:
+                authorized = (stored.get("save_resolution") == "again" and after
+                              and after.get("generation") == int(before.get("generation", 0)) + 1
+                              and all(after.get(key) == before.get(key) for key in ("backend", "container")))
+                if not authorized:
+                    raise RuntimeError("Unresolved Apple save operation cannot be replaced")
+        card["updated_at"] = now()
+        CARD_DIR.mkdir(parents=True, exist_ok=True)
+        payload = dict(card)
+        if apple:
+            payload["_apple_state_version"] = version + 1
+        _atomic_write(card_path(card["id"]), json.dumps(payload, ensure_ascii=False, indent=2))
+        if apple:
+            card["_apple_state_version"] = version + 1
 
 
 def load_card(card_id: str) -> Optional[dict]:

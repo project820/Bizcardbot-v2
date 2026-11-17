@@ -27,7 +27,7 @@ def batch_summary(members: list[dict], scope: str, title: str) -> tuple[str, Opt
     lines = [f"{title} {len(members)}건: 저장 가능 {len(ready)} · 입력 필요 {len(needs_input)} · 저장됨 {len(saved)}"]
     for card in members:
         draft = pipeline.current_draft(card)
-        mark = {"saved": "저장됨", "save_failed": "저장 보류", "cancelled": "취소", "processing": "처리 중"}.get(card["status"])
+        mark = {"saved": "저장됨", "saving": "저장 중", "save_failed": "저장 보류", "cancelled": "취소", "processing": "처리 중", "needs_confirmation": "저장 확인 필요"}.get(card["status"])
         if card["status"] == "review":
             mark = "확인 필요" if (draft.warnings or not draft.is_savable) else "준비"
         lines.append(f"- {cards.label(card)} {draft.display_name or '(이름 없음)'} · {mark}")
@@ -54,6 +54,8 @@ def save_result_text(card: dict, outcome: dict, retried: bool = False) -> str:
             if "사진" not in warning:
                 lines.append(f"참고: {warning}")
         return "\n".join(lines)
+    if outcome.get("needs_confirmation"):
+        return f"{cards.label(card)} 저장 확인 필요: {name}\n{outcome['message']}"
     if outcome.get("stale") or outcome.get("invalid"):
         return f"{cards.label(card)} {outcome['message']}"
     hint = {

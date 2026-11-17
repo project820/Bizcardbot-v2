@@ -423,6 +423,25 @@ def _save_env_locked(path, token, chat_id, *, expected_tokens):
                     raise SetupError("기존 TELEGRAM_ALLOWED_CHAT_IDS에 숫자가 아닌 값이 있습니다.") from None
     replacements = {"TELEGRAM_BOT_TOKEN": token,
                     "TELEGRAM_ALLOWED_CHAT_IDS": ",".join(str(value) for value in sorted(ids))}
+    _write_env_locked(path, text, replacements)
+
+
+def save_settings(path, replacements):
+    """Update arbitrary onboarding settings using the same lock and atomic writer."""
+    import shlex
+    path = Path(path)
+    descriptor = os.open(path.with_name(path.name + ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    with os.fdopen(descriptor, "a") as lock:
+        os.fchmod(lock.fileno(), 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        text = _read_env(path)
+        # Validate the current file before replacing any assignment.
+        if path.exists():
+            read_settings(path)
+        _write_env_locked(path, text, {key: shlex.quote(value) for key, value in replacements.items()})
+
+
+def _write_env_locked(path, text, replacements):
     lines = []
     seen = set()
     newline = "\r\n" if "\r\n" in text else "\n"

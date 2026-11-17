@@ -189,6 +189,20 @@ class PipelineTest(CardTestCase):
         self.assertEqual(uploads, ["people/c1"])
         self.assertEqual(cards.load_card(card["id"])["photo_status"], "uploaded")
 
+    def test_apple_photo_retry_recovers_changed_identifier_without_creating_contact(self):
+        from bizcard_intake import apple_contacts
+        card = self.review_card()
+        card.update(status="saved", resource_name="apple:old", photo_status="failed")
+        cards.save_card(card)
+        with patch.object(apple_contacts, "get_contact", side_effect=ContactSaveError("gone", kind="not_found")), patch.object(
+            apple_contacts, "find_existing_candidates", return_value=({"resourceName": "apple:new"}, 1)
+        ), patch.object(pipeline, "upload_photo") as photo, patch.object(apple_contacts, "create_contact") as create:
+            pipeline.retry_due(force=True)
+        photo.assert_called_once_with("apple:new", card["images"]["profile"])
+        create.assert_not_called()
+        self.assertEqual(cards.load_card(card["id"])["resource_name"], "apple:new")
+
+
 
 class LegacyMigrationTest(CardTestCase):
     def write(self, folder, name, data):

@@ -139,6 +139,8 @@ python3 -m venv .venv
 7. **엄격한 검사를 통과한 뒤 주석 태그를 만든다.**
    이 시점에는 작업트리가 깨끗하고 같은 태그가 없어야 한다.
    태그를 만든 뒤에는 태그 미존재 검사가 실패하므로 먼저 검사한다.
+   커밋과 태그의 작성자 이메일은 GitHub의 공개용 noreply 주소를 쓴다.
+   개인 이메일이 들어간 태그는 GitHub 이메일 보호 설정이 거부한다.
 
    ```sh
    .venv/bin/python scripts/release.py check

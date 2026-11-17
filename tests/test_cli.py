@@ -55,7 +55,8 @@ class ProjectSettingsTest(unittest.TestCase):
         (self.root / ".env").write_text(
             "TELEGRAM_BOT_TOKEN=synthetic-token\nTELEGRAM_ALLOWED_CHAT_IDS=123\n"
             "OPENAI_API_KEY=synthetic-key\nBIZCARD_PARSER=openai\n"
-            "BIZCARD_OPENAI_MODEL=file-model\nBIZCARD_CROSSCHECK=auto\n",
+            "BIZCARD_OPENAI_MODEL=file-model\nBIZCARD_CROSSCHECK=auto\n"
+            "BIZCARD_CONTACTS_BACKEND=google\n",
         )
 
         def inspect_settings():

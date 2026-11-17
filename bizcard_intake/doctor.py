@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from typing import Callable, Optional
 from urllib.request import urlopen
 
-from . import parser
+from . import parser, apple_contacts, contact_backend
 from .contacts import CONTACTS_SCOPE, LOGIN_COMMAND, ContactSaveError, gws_auth_status, run_gws
 from .image_processing import _ensure_vision_rectifier
 from .vision_ocr import _ensure_vision_ocr
@@ -73,6 +73,23 @@ def check_gws() -> Check:
     return Check("gws", True, f"로그인됨: {status.get('user', '?')}")
 
 
+def check_apple() -> Check:
+    try:
+        status = apple_contacts.run_helper("status").get("status")
+        if status != "authorized":
+            fix = ("python -m bizcard_intake setup-contacts 실행 후 허용하세요. "
+                   "launchd 봇은 첫 실행 때 Python 권한을 다시 요청합니다.") if status == "notDetermined" else apple_contacts.AUTH_MESSAGE
+            return Check("apple", False, f"Mac 연락처 권한: {status}", fix)
+        result = apple_contacts.run_helper("containers")
+        identifier = apple_contacts.container_id() or result.get("defaultIdentifier")
+        container = next((item for item in result.get("containers", []) if item["id"] == identifier), None)
+        if container is None:
+            return Check("apple", False, "선택한 Mac 연락처 계정이 없습니다.", "python -m bizcard_intake setup-contacts")
+        return Check("apple", True, f"Mac 연락처({container['name']}) 준비됨")
+    except ContactSaveError as exc:
+        return Check("apple", False, str(exc), apple_contacts.AUTH_MESSAGE if exc.kind == "auth" else "python -m bizcard_intake setup-contacts")
+
+
 def check_parser() -> Check:
     backend = parser.backend_name()
     if backend == "openai":
@@ -128,7 +145,20 @@ CHECKS: dict[str, Callable[[], Check]] = {
 def run_checks(names: Optional[list[str]] = None) -> list[Check]:
     if names is None:
         names = list(CHECKS)
-    return [CHECKS[name]() for name in names]
+    checks = []
+    for name in names:
+        if name in ("gws", "apple", "contacts"):
+            try:
+                backend = contact_backend.backend_name()
+            except ContactSaveError as exc:
+                checks.append(Check("contacts", False, str(exc), "python -m bizcard_intake setup-contacts"))
+                continue
+            if backend == "apple":
+                checks.append(check_apple())
+                continue
+            name = "gws"
+        checks.append(CHECKS[name]())
+    return checks
 
 
 def format_report(checks: list[Check]) -> str:

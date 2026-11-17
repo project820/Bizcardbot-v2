@@ -16,7 +16,8 @@ from urllib.parse import quote, urlencode
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from . import cards, contacts, doctor, pipeline
+from . import cards, contact_backend as contacts, doctor, pipeline
+from . import apple_contacts
 from .chat_ux import HELP_TEXT, HELP_WORDS, LIST_WORDS, batch_summary, edit_prompt, save_result_text, select_card
 from .pipeline import DATA_DIR, LOG_DIR
 
@@ -187,6 +188,10 @@ def _alert_token_conflict(token: str, bot_id: int) -> None:
 def run(token: str, data_dir: Path = DATA_DIR) -> None:
     if not allowed_chat_ids():
         raise SystemExit("TELEGRAM_ALLOWED_CHAT_IDS is required (comma-separated chat ids allowed to use the bot)")
+    try:
+        initialize_contacts(token)
+    except Exception:
+        log.warning("contacts initialization failed; continuing polling")
     for note in pipeline.migrate_legacy():
         log.info("migrated: %s", note)
     recover_interrupted()
@@ -276,23 +281,94 @@ def recover_interrupted() -> None:
         cards.save_card(card)
 
 
+def _send_health_alert(token: str, text: str, *, apple_permission: bool = False,
+                       alert_key: str | None = None) -> None:
+    try:
+        alert = os.environ.get("BIZCARD_ALERT_CHAT_ID")
+        targets = []
+        if alert:
+            try:
+                targets = [int(alert)]
+            except (ValueError, TypeError):
+                log.warning("invalid contacts alert chat id")
+        if not targets and apple_permission:
+            targets = sorted(allowed_chat_ids())
+        if not targets:
+            return
+        if alert_key:
+            state_name = "contacts_alert" if apple_permission else "contacts_health_alert"
+            state = cards.load_state(state_name)
+            now = time.time()
+            if state.get("key") == alert_key and now - state.get("timestamp", 0) < HEALTH_CHECK_INTERVAL:
+                return
+            # Persist before sending, including uncertain sends across restart.
+            cards.save_state(state_name, {"key": alert_key, "timestamp": now})
+        for chat_id in targets:
+            try:
+                send_message(token, chat_id, text)
+            except Exception:
+                log.warning("failed to send contacts health alert")
+    except Exception:
+        log.warning("contacts health alert unavailable")
+
+
+def _permission_alert(token: str, status: str) -> None:
+    _send_health_alert(token, apple_contacts.AUTH_MESSAGE, apple_permission=True,
+                       alert_key="apple:permission:" + status)
+
+
+def initialize_contacts(token: str) -> None:
+    """Request TCC before workers; initialization must never stop polling."""
+    try:
+        if contacts.backend_name() != "apple":
+            return
+        status = apple_contacts.run_helper("status").get("status")
+        if status == "notDetermined":
+            status = apple_contacts.run_helper("request").get("status")
+        if status != "authorized":
+            _permission_alert(token, status or "unknown")
+        else:
+            cards.save_state("contacts_alert", {"key": "apple:healthy", "timestamp": time.time()})
+    except contacts.ContactSaveError as exc:
+        if exc.kind == "auth":
+            _permission_alert(token, "denied")
+        else:
+            _send_health_alert(token, str(exc), alert_key="apple:initialization:" + exc.kind)
+    except Exception:
+        log.warning("contacts initialization failed; continuing polling")
+
+
 def health_check(token: str) -> list[doctor.Check]:
-    """Verify the external dependencies and alert the admin chat on failure."""
+    """Verify dependencies; only Apple permission errors may use allowed chats."""
     failed = [check for check in doctor.run_checks(["parser", "gws"]) if not check.ok]
     for check in failed:
         log.warning("health check: %s: %s", check.name, check.detail)
-    alert_chat_id = os.environ.get("BIZCARD_ALERT_CHAT_ID")
-    if failed and alert_chat_id:
+    remaining = failed
+    if any(c.name == "apple" for c in failed):
+        try:
+            status = apple_contacts.run_helper("status").get("status", "unknown")
+            if status != "authorized":
+                _permission_alert(token, status)
+                remaining = [c for c in failed if c.name != "apple"]
+            else:
+                cards.save_state("contacts_alert", {"key": "apple:healthy", "timestamp": time.time()})
+        except Exception:
+            log.warning("contacts permission check unavailable")
+    elif contacts.backend_name() == "apple":
+        # Observed recovery clears the key so a later denial alerts immediately.
+        try:
+            cards.save_state("contacts_alert", {"key": "apple:healthy", "timestamp": time.time()})
+        except Exception:
+            log.warning("contacts health state unavailable")
+    if remaining:
         waiting = pipeline.pending_retry_count()
-        text = "봇 점검 경고\n" + "\n".join(f"- {c.detail}\n  해결: {c.fix}" for c in failed)
+        text = "봇 점검 경고\n" + "\n".join(f"- {c.detail}\n  해결: {c.fix}" for c in remaining)
         if waiting:
             text += f"\n\n저장 대기 중인 명함 {waiting}건은 문제가 해결되면 자동으로 저장합니다."
-        try:
-            send_message(token, int(alert_chat_id), text)
-        except Exception:
-            log.exception("failed to send health alert")
-    if not any(c.name == "gws" for c in failed):
-        log.info("health check ok" if not failed else "health check: gws ok")
+        key = "apple:health:" + "|".join(c.name + ":" + c.detail for c in remaining) if contacts.backend_name() == "apple" else None
+        _send_health_alert(token, text, alert_key=key)
+    if not any(c.name in ("gws", "apple", "contacts") for c in failed):
+        log.info("health check ok" if not failed else "health check: contacts ok")
         retry_due_and_report(token, force=True)
     return failed
 
@@ -300,7 +376,7 @@ def health_check(token: str) -> list[doctor.Check]:
 def retry_due_and_report(token: str, force: bool = False) -> None:
     def report(card: dict, outcome: dict) -> None:
         chat_id = int(card["chat_id"]) if str(card.get("chat_id", "")).lstrip("-").isdigit() else None
-        if chat_id is None or (not outcome["ok"] and not force):
+        if chat_id is None or (not outcome["ok"] and not force and not outcome.get("needs_confirmation")):
             return  # quiet on background failures; the next health check summarises them
         try:
             send_message(token, chat_id, save_result_text(card, outcome, retried=True), reply_markup=None if outcome["ok"] else saved_failed_buttons(card))
@@ -543,19 +619,25 @@ def handle_text(token: str, chat_id: int, message: dict) -> None:
 
 
 def send_open_list(token: str, chat_id: int) -> None:
-    open_cards = cards.list_cards(chat_id, cards.REVIEW_STATUSES + ("processing",))
+    open_cards = cards.list_cards(chat_id, cards.OPEN_STATUSES)
     if not open_cards:
         send_message(token, chat_id, "저장 안 된 명함이 없습니다.")
         return
     text, markup = batch_summary(open_cards, "all", "저장 안 된 명함")
-    send_message(token, chat_id, text + "\n\n각 명함을 고치려면 해당 초안 메시지에 답장하세요.", reply_markup=markup)
+    if any(card["status"] in cards.REVIEW_STATUSES for card in open_cards):
+        text += "\n\n검토 중이거나 저장 보류된 명함을 고치려면 해당 초안 메시지에 답장하세요."
+    send_message(token, chat_id, text, reply_markup=markup)
+    for card in open_cards:
+        if card["status"] == "needs_confirmation":
+            send_message(token, chat_id, f"{cards.label(card)} 저장 여부를 버튼으로 확인하세요.", reply_markup=saved_failed_buttons(card))
 
 
 # ---------------------------------------------------------------- buttons
 
 def handle_callback(token: str, callback: dict, chat_id: int) -> None:
     callback_id = callback.get("id")
-    if callback_id:
+    is_confirmation = str(callback.get("data") or "").split(":", 1)[0] in ("cs", "cr", "ck")
+    if callback_id and not is_confirmation:
         try:
             api_post(token, "answerCallbackQuery", {"callback_query_id": callback_id})
         except Exception:
@@ -567,7 +649,7 @@ def handle_callback(token: str, callback: dict, chat_id: int) -> None:
     if action == "ba":
         submit(approve_batch, token, chat_id, rest)
         return
-    if action not in ("ap", "cx", "ed", "bk", "rs", "sv"):
+    if action not in ("ap", "cx", "ed", "bk", "rs", "sv", "cs", "cr", "ck"):
         send_message(token, chat_id, "예전 버튼입니다. 최근 초안 메시지의 버튼을 눌러주세요. ('목록'으로 확인)")
         return
     card_id, _, revision = rest.partition(":")
@@ -576,7 +658,10 @@ def handle_callback(token: str, callback: dict, chat_id: int) -> None:
         send_message(token, chat_id, "해당 명함을 찾을 수 없습니다. '목록'으로 확인해주세요.")
         return
 
-    if action in ("ap", "sv"):
+    if action in ("cs", "cr", "ck"):
+        # Nonce is independent of the draft revision; old numeric callbacks are stale.
+        submit(confirm_card, token, chat_id, card, {"cs": "saved", "cr": "again", "ck": "skip"}[action], revision, callback)
+    elif action in ("ap", "sv"):
         submit(approve_card, token, chat_id, card, int(revision) if revision.isdigit() and action == "ap" else None)
     elif action == "cx":
         if card["status"] == "saved":
@@ -586,29 +671,71 @@ def handle_callback(token: str, callback: dict, chat_id: int) -> None:
             send_message(token, chat_id, f"{cards.label(card)} 취소했습니다.")
         else:
             send_message(token, chat_id, f"{cards.label(card)} 저장이 시작되었거나 종료되어 취소하지 못했습니다.")
-    elif action == "ed":
-        prompt = edit_prompt(card)
-        result = send_message(token, chat_id, prompt, reply_markup={"force_reply": True, "input_field_placeholder": "직함: 과장"})
-        cards.remember_message(card, result["result"]["message_id"])
-        cards.save_card(card)
-    elif action == "bk":
-        card["awaiting_back"] = True
-        result = send_message(token, chat_id, f"{cards.label(card)} 뒷면 사진을 이 메시지에 답장으로 보내주세요.", reply_markup={"force_reply": True})
-        cards.remember_message(card, result["result"]["message_id"])
-        cards.save_card(card)
-    elif action == "rs":
-        if not card["images"].get("front") or not Path(card["images"]["front"]).exists():
-            send_message(token, chat_id, f"{cards.label(card)} 원본 사진이 없어 재인식할 수 없습니다. 사진을 다시 보내주세요.")
+    elif action in ("ed", "bk", "rs"):
+        _handle_draft_callback(token, chat_id, card, action)
+
+
+def _handle_draft_callback(token: str, chat_id: int, card: dict, action: str) -> None:
+    # Do not block polling behind a slow Contacts write or mutate its version.
+    with pipeline.card_lock(card["id"], blocking=False) as acquired:
+        if not acquired:
+            send_message(token, chat_id, f"{cards.label(card)} 저장 중입니다. 잠시 후 다시 눌러주세요.")
             return
-        status_id = send_status(token, chat_id, f"{cards.label(card)} 다시 인식하는 중")
-        card["status"] = "processing"
-        cards.save_card(card)
+        fresh = cards.load_card(card["id"])
+        if not fresh or fresh["status"] not in cards.REVIEW_STATUSES:
+            note = "저장 중입니다." if fresh and fresh["status"] == "saving" else "지금은 수정할 수 없는 상태입니다. 최근 안내를 확인하세요."
+            send_message(token, chat_id, f"{cards.label(card)} {note}")
+            return
+        card.clear()
+        card.update(fresh)
+        if action == "rs":
+            if not card["images"].get("front") or not Path(card["images"]["front"]).exists():
+                send_message(token, chat_id, f"{cards.label(card)} 원본 사진이 없어 재인식할 수 없습니다. 사진을 다시 보내주세요.")
+                return
+            status_id = send_status(token, chat_id, f"{cards.label(card)} 다시 인식하는 중")
+            card["status"] = "processing"
+            cards.save_card(card)
+        else:
+            if action == "ed":
+                prompt = edit_prompt(card)
+                markup = {"force_reply": True, "input_field_placeholder": "직함: 과장"}
+            else:
+                card["awaiting_back"] = True
+                prompt = f"{cards.label(card)} 뒷면 사진을 이 메시지에 답장으로 보내주세요."
+                markup = {"force_reply": True}
+            result = send_message(token, chat_id, prompt, reply_markup=markup)
+            cards.remember_message(card, result["result"]["message_id"])
+            cards.save_card(card)
+    if action == "rs":
         submit(_recognize_again, token, chat_id, card, status_id)
 
 
 def _recognize_again(token: str, chat_id: int, card: dict, status_id: int) -> None:
     pipeline.recognize_front(card)
     show_draft(token, chat_id, card, status_id)
+
+
+def confirm_card(token: str, chat_id: int, card: dict, choice: str, confirmation_id: str,
+                 callback: Optional[dict] = None) -> None:
+    outcome = pipeline.resolve_confirmation(card, choice, confirmation_id)
+    callback = callback or {}
+    if callback.get("id"):
+        try:
+            api_post(token, "answerCallbackQuery", {"callback_query_id": callback["id"],
+                     "text": "이미 처리됨" if outcome.get("stale") else "처리했습니다"})
+        except Exception:
+            log.warning("confirmation callback answer failed")
+    message_id = (callback.get("message") or {}).get("message_id")
+    if message_id is not None:
+        try:
+            api_post(token, "editMessageReplyMarkup", {"chat_id": chat_id, "message_id": message_id,
+                     "reply_markup": {"inline_keyboard": []}})
+        except Exception:
+            log.warning("confirmation keyboard removal failed")
+    if not outcome.get("stale"):
+        text = save_result_text(card, outcome) if choice == "again" else outcome["message"]
+        send_message(token, chat_id, text,
+                     reply_markup=None if outcome["ok"] else saved_failed_buttons(card))
 
 
 def approve_card(token: str, chat_id: int, card: dict, revision: Optional[int]) -> dict:
@@ -630,7 +757,7 @@ def approve_batch(token: str, chat_id: int, scope: str) -> None:
     if not targets:
         send_message(token, chat_id, "저장할 수 있는 명함이 없습니다.")
         return
-    status_id = send_status(token, chat_id, f"{len(targets)}건 저장 중… (Google 연락처는 한 건씩 저장합니다)")
+    status_id = send_status(token, chat_id, f"{len(targets)}건 저장 중… ({contacts.destination_name()}에 한 건씩 저장합니다)")
     lines = []
     ok = 0
     last_progress = time.monotonic()
@@ -670,6 +797,12 @@ def draft_buttons(card: dict) -> dict:
 
 def saved_failed_buttons(card: dict) -> dict:
     cid = card["id"]
+    if card.get("status") == "needs_confirmation":
+        rev = pipeline.confirmation_token(card)
+        return {"inline_keyboard": [[
+            {"text": "이미 저장됨", "callback_data": f"cs:{cid}:{rev}"},
+            {"text": "다시 저장", "callback_data": f"cr:{cid}:{rev}"},
+            {"text": "건너뛰기", "callback_data": f"ck:{cid}:{rev}"}]]}
     return {"inline_keyboard": [[{"text": "지금 다시 저장", "callback_data": f"sv:{cid}"}, {"text": "직접 수정", "callback_data": f"ed:{cid}"}, {"text": "취소", "callback_data": f"cx:{cid}"}]]}
 
 
