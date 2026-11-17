@@ -11,10 +11,11 @@ Mac 연락처에서 Google 계정을 선택하면 Google Cloud 설정 없이 동
 처음 설치는 [Quick start](#quick-start)를 따른다.
 v1 사용자는 [업그레이드 방법](CHANGELOG.md)을 따른다.
 
-현재 버전: **2.1.0**
+현재 버전: **2.1.1**
 
 ## 새 소식 (What's new)
 
+- **v2.1.1**은 릴리스 노트 링크와 공개 전 검사를 고친 패치다. 봇 동작은 v2.1.0과 같다.
 - **v2.1.0**은 Mac 연락처 저장과 계정 선택을 추가한다.
   `python3 -m bizcard_intake setup-contacts`로 연결 방식을 고른다.
 
