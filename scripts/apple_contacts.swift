@@ -1,6 +1,7 @@
 // JSON stdin/stdout bridge to Contacts. Never fetch CNContactNoteKey: entitlement required.
 import Foundation
 import Contacts
+import Carbon
 
 struct HelperError: Error {
     let kind: String
@@ -220,10 +221,102 @@ func apply(_ person: [String: Any], to contact: CNMutableContact, replaceOrganiz
     contact.postalAddresses = addresses
 }
 
+func automationName(_ code: OSStatus) -> String {
+    switch code {
+    case 0: return "authorized"
+    case -1744: return "not_determined"
+    case -1743: return "denied"
+    case -600, -1712: return "timeout"
+    default: return "error"
+    }
+}
+
+func scriptErrorKind(_ code: Int) -> String {
+    switch code {
+    case -1744, -1743: return "auth"
+    case -1728: return "not_found"
+    case -600, -1712: return "transient"
+    default: return "other"
+    }
+}
+
+func automationPermission(_ ask: Bool) throws -> OSStatus {
+    // A stopped target returns -600; open without activating before the probe.
+    let open = Process()
+    open.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+    open.arguments = ["-gj", "-b", "com.apple.AddressBook"]
+    open.standardOutput = FileHandle.nullDevice
+    open.standardError = FileHandle.nullDevice
+    try open.run()
+    open.waitUntilExit()
+    guard open.terminationStatus == 0 else { try fail("transient", "연락처 앱을 열지 못했습니다.") }
+    let target = NSAppleEventDescriptor(bundleIdentifier: "com.apple.AddressBook")
+    return AEDeterminePermissionToAutomateTarget(target.aeDesc, typeWildCard, typeWildCard, ask)
+}
+
+func callHandler(_ source: String, _ handler: String, _ values: [String]) throws -> NSAppleEventDescriptor {
+    guard let script = NSAppleScript(source: source) else { try fail("other", "메모 스크립트를 준비하지 못했습니다.") }
+    let event = NSAppleEventDescriptor(eventClass: AEEventClass(kASAppleScriptSuite),
+                                      eventID: AEEventID(kASSubroutineEvent),
+                                      targetDescriptor: nil, returnID: AEReturnID(kAutoGenerateReturnID),
+                                      transactionID: AETransactionID(kAnyTransactionID))
+    event.setParam(NSAppleEventDescriptor(string: handler), forKeyword: AEKeyword(keyASSubroutineName))
+    let arguments = NSAppleEventDescriptor.list()
+    for (index, value) in values.enumerated() {
+        arguments.insert(NSAppleEventDescriptor(string: value), at: index + 1)
+    }
+    event.setParam(arguments, forKeyword: AEKeyword(keyDirectObject))
+    var error: NSDictionary?
+    let result = script.executeAppleEvent(event, error: &error)
+    if let failure = error {
+        let code = (failure[NSAppleScript.errorNumber] as? NSNumber)?.intValue ?? 0
+        try fail(scriptErrorKind(code), "연락처 메모를 추가하지 못했습니다.")
+    }
+    return result
+}
+
+let noteScript = """
+on setnote(cid, marker, body)
+    with timeout of 15 seconds
+        tell application id "com.apple.AddressBook"
+            set targetPerson to person id cid
+            set oldNote to note of targetPerson
+            if oldNote is missing value then set oldNote to ""
+            if oldNote contains marker then return false
+            if oldNote is "" then
+                set note of targetPerson to body
+            else
+                set note of targetPerson to oldNote & linefeed & linefeed & body
+            end if
+            save
+            return true
+        end tell
+    end timeout
+end setnote
+"""
+
 func execute(_ input: [String: Any]) throws -> [String: Any] {
     let command = input["command"] as? String ?? ""
     if command == "status" { return ["status": statusName()] }
+    if command == "automation-status" || command == "automation-request" {
+        let code = try automationPermission(command == "automation-request")
+        return ["status": automationName(code), "code": code]
+    }
     let store = CNContactStore()
+    if command == "set-note" {
+        guard let identifier = input["identifier"] as? String, !identifier.isEmpty,
+              let marker = input["marker"] as? String, !marker.isEmpty,
+              let body = input["body"] as? String, !body.isEmpty else {
+            try fail("invalid", "메모 입력값이 없습니다.")
+        }
+        // Check and send from the same executable/TCC identity. Never prompt here.
+        let code = try automationPermission(false)
+        guard code == 0 else { try fail(scriptErrorKind(Int(code)), "연락처 자동화 권한을 확인하세요.") }
+        try requireAccess()
+        _ = try fetchPinned(store, input)
+        let result = try callHandler(noteScript, "setnote", [identifier, marker, body])
+        return ["written": result.booleanValue]
+    }
     if command == "request" {
         if statusName() == "notDetermined" {
             let semaphore = DispatchSemaphore(value: 0)

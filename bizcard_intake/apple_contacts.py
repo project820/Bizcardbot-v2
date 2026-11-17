@@ -25,7 +25,7 @@ BINARY = ROOT / ".cache" / "apple_contacts"
 HELPER_TIMEOUT = 30
 AUTH_MESSAGE = "Mac 연락처 접근을 허용하세요. 시스템 설정 > 개인정보 보호 및 보안 > 연락처에서 봇의 Python을 켜세요."
 UNKNOWN_MESSAGE = "Mac 연락처 저장 응답을 확인하지 못했습니다. 연락처 앱에서 저장 여부를 확인하세요."
-NOTE_WARNING = "Mac 연락처는 메모·검증 경고를 저장하지 않습니다. 명함 초안에서 확인하세요."
+NOTE_WARNING = "참고: 메모는 Mac 권한을 허용하면 자동으로 추가합니다."
 _build_lock = threading.Lock()
 
 
@@ -88,6 +88,29 @@ def run_helper(command: str, *, _timeout=None, **payload) -> dict:
         raise ContactSaveError(UNKNOWN_MESSAGE if uncertain else "Mac 연락처 작업에 실패했습니다.",
                                kind="unknown_outcome" if uncertain else "other")
     return result
+
+
+def automation_status() -> str:
+    """Probe only; this must never ask macOS for permission."""
+    try:
+        return run_helper("automation-status", _timeout=5).get("status", "error")
+    except ContactSaveError as exc:
+        return "timeout" if exc.kind == "transient" else "error"
+
+
+def request_automation() -> str:
+    """Explicit UI action only; the caller runs this on a dedicated thread."""
+    try:
+        return run_helper("automation-request", _timeout=600).get("status", "error")
+    except ContactSaveError as exc:
+        return "timeout" if exc.kind == "transient" else "error"
+
+
+def set_note(resource_name: str, marker: str, body: str, *, container=None) -> bool:
+    payload = {"identifier": _identifier(resource_name), "marker": marker, "body": body}
+    if container:
+        payload["container"] = container
+    return bool(run_helper("set-note", _timeout=20, **payload).get("written"))
 
 
 def container_id() -> str:
@@ -435,7 +458,8 @@ def save_contact(draft: CardDraft, profile_image_path: str | None, resource_name
             checkpoint(saved_name, action)
         except Exception:
             warnings.append("저장 기록 실패: 연락처 앱에서 저장 여부를 확인하세요.")
-    if contacts._biography(draft):
+    from . import meeting_note
+    if contacts._biography(draft) and meeting_note.status()["automation"] != "authorized":
         warnings.append(NOTE_WARNING)
     result = SaveResult(action, saved_name, warnings=warnings, display_name=draft.display_name)
     if operation:

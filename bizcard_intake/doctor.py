@@ -91,6 +91,13 @@ def check_apple() -> Check:
         return Check("apple", False, str(exc), apple_contacts.AUTH_MESSAGE if exc.kind == "auth" else "python -m bizcard_intake setup-contacts")
 
 
+def check_notes() -> Check:
+    from . import meeting_note
+    saved = meeting_note.status()
+    return Check("notes", True,
+                 f"봇 기록: 메모 권한 {saved['automation']}, 대기 {saved['pending']}건")
+
+
 def check_parser() -> Check:
     backend = parser.backend_name()
     if backend == "openai":
@@ -177,6 +184,7 @@ def run_checks(names: Optional[list[str]] = None) -> list[Check]:
                 continue
             if backend == "apple":
                 checks.append(check_apple())
+                checks.append(check_notes())
                 continue
             name = "gws"
         checks.append(CHECKS[name]())

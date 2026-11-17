@@ -235,9 +235,32 @@ def build_update(existing: dict[str, Any], draft: CardDraft) -> dict[str, Any]:
         merged = _union(key, existing.get(key, []), new.get(key, []))
         if merged:
             person[key] = merged
-    if "biographies" in new:
-        person["biographies"] = new["biographies"]
+    old_note = "\n\n".join(item.get("value", "") for item in existing.get("biographies", []) if item.get("value"))
+    addition = _biography(draft)
+    biography = old_note
+    if addition and addition not in old_note:
+        biography = "\n\n".join(part for part in (old_note, addition) if part)
+    if biography:
+        person["biographies"] = [{"value": biography, "contentType": "TEXT_PLAIN"}]
     return person
+
+
+def set_note(resource_name: str, marker: str, body: str) -> bool:
+    """Append the shared compose() block without replacing user-authored notes."""
+    if not marker or not body or not resource_name.startswith("people/"):
+        raise ContactSaveError("메모 입력값을 확인하세요.", kind="invalid")
+    existing = get_contact(resource_name)
+    old = "\n\n".join(item.get("value", "") for item in existing.get("biographies", []) if item.get("value"))
+    if marker in old:
+        return False
+    person = {"resourceName": resource_name,
+              "biographies": [{"value": "\n\n".join(part for part in (old, body) if part), "contentType": "TEXT_PLAIN"}]}
+    if existing.get("etag"):
+        person["etag"] = existing["etag"]
+    params = {"resourceName": resource_name, "updatePersonFields": "biographies"}
+    run_gws(["people", "people", "updateContact", "--params", json.dumps(params),
+             "--json", json.dumps(person, ensure_ascii=False)])
+    return True
 
 
 def _union(key: str, old_items: list[dict], new_items: list[dict]) -> list[dict]:
