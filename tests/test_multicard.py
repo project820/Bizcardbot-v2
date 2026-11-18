@@ -46,9 +46,10 @@ class DetectTest(unittest.TestCase):
             rects.append({"index": i, "box": box, "confidence": 1.0, "crop_path": str(crop), "corners": corners(*box)})
         return {"image_width": 4000, "image_height": 3000, "rectangles": rects}
 
-    def detect(self, boxes, chars=40):
+    def detect(self, boxes, chars=40, lines=()):
         with patch.object(multicard, "_run_helper", return_value=self.helper_output(boxes)) as run, \
-             patch.object(multicard, "_text_chars", side_effect=chars if isinstance(chars, list) else lambda p: chars):
+             patch.object(multicard, "_text_chars", side_effect=chars if isinstance(chars, list) else lambda p: chars), \
+             patch.object(multicard, "_text_lines", return_value=None if lines is None else list(lines)):
             return multicard.detect(self.photo, self.tmp / "work"), run
 
     def row(self, n, width=0.2):
@@ -85,6 +86,14 @@ class DetectTest(unittest.TestCase):
         result, _ = self.detect(self.row(3), chars=[40, 40, None])
         self.assertEqual((result.kind, result.crops), ("single", ()))
         self.assertFalse((self.tmp / "work").exists())
+
+    def test_text_outside_the_found_cards_marks_a_possible_missing_card(self):
+        inside = {"chars": 30, "center": [0.15, 0.2]}      # within the first card of row(2)
+        outside = {"chars": 30, "center": [0.9, 0.9]}      # a card Vision did not find
+        for lines, expected in (([inside], False), ([inside, outside], True), (None, True)):
+            with self.subTest(lines=lines):
+                result, _ = self.detect(self.row(2), lines=lines)
+                self.assertEqual((result.kind, result.leftover), ("split", expected))
 
     def test_helper_failure_or_undecodable_image_keeps_single_path(self):
         with patch.object(multicard, "_run_helper", return_value=None):

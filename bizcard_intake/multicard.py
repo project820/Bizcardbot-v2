@@ -30,6 +30,7 @@ MIN_TEXT_CHARS = 20   # empty table patches, shadows and logos read as 0 charact
 SIDE_RATIO = 0.75     # opposite sides of a card stay within 25% even with camera tilt
 ASPECT = (1.25, 2.10)
 OVERLAP = 0.5         # a candidate half inside a larger one is a logo or a duplicate
+LEFTOVER_GROW = 1.06  # cover card edges when blanking found cards
 
 log = logging.getLogger("bizcard")
 
@@ -39,6 +40,7 @@ class Split:
     kind: str                      # single | split | too_many | too_small
     crops: tuple[Path, ...] = ()
     count: int = 0
+    leftover: bool = False         # text remains outside the found cards; a card may be missing
 
 
 def enabled() -> bool:
@@ -60,6 +62,8 @@ def detect(source: Path, work_dir: Path) -> Split:
         output = _run_helper(source, work_dir)
         if output:
             result = _decide(output)
+            if result.kind == "split" and _has_leftover_text(source, output, result.crops):
+                result = Split("split", result.crops, result.count, leftover=True)
     except Exception:
         log.exception("multicard detection failed; using the whole photo")
     if result is None or result.kind != "split":
@@ -142,6 +146,56 @@ def _text_chars(path: Path) -> Optional[int]:
     if result.failed:
         return None
     return sum(not c.isspace() for c in result.text)
+
+
+def _has_leftover_text(source: Path, output: dict, crops) -> bool:
+    """True when text lies outside every accepted card, or the text pass failed.
+
+    Apple Vision misses some cards entirely (about 1 in 5 synthetic 3-4 card
+    photos); this keeps such a miss from passing silently.
+    """
+    lines = _text_lines(source)
+    if lines is None:
+        return True
+    width, height = output["image_width"], output["image_height"]
+    accepted = {str(p) for p in crops}
+    quads = [_grown(r["corners"], width, height) for r in output["rectangles"] if r["crop_path"] in accepted]
+    outside = sum(line["chars"] for line in lines
+                  if not any(_inside((line["center"][0] * width, line["center"][1] * height), quad) for quad in quads))
+    return outside >= MIN_TEXT_CHARS
+
+
+def _grown(corners, width, height) -> list[tuple[float, float]]:
+    cx = sum(x for x, _ in corners) / 4
+    cy = sum(y for _, y in corners) / 4
+    return [((cx + (x - cx) * LEFTOVER_GROW) * width, (cy + (y - cy) * LEFTOVER_GROW) * height) for x, y in corners]
+
+
+def _inside(point, quad) -> bool:
+    signs = set()
+    for i in range(4):
+        (x1, y1), (x2, y2) = quad[i], quad[(i + 1) % 4]
+        cross = (x2 - x1) * (point[1] - y1) - (y2 - y1) * (point[0] - x1)
+        if cross:
+            signs.add(cross > 0)
+    return len(signs) <= 1
+
+
+def _text_lines(path: Path) -> Optional[list[dict]]:
+    """Every text line in the whole photo, small text included; None on failure."""
+    binary = _ensure_helper()
+    if binary is None:
+        return None
+    try:
+        completed = subprocess.run([str(binary), "--text", str(path)],
+                                   check=False, capture_output=True, text=True, timeout=20)
+        if completed.returncode != 0:
+            log.warning("vision_cards --text failed: %s", completed.stderr.strip()[:200])
+            return None
+        return list(json.loads(completed.stdout)["lines"])
+    except Exception:
+        log.exception("vision_cards --text failed")
+        return None
 
 
 def _run_helper(source: Path, work_dir: Path) -> Optional[dict]:

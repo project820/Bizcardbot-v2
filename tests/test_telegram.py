@@ -566,6 +566,8 @@ def fake_split(*counts):
 
     def detect(source, work_dir):
         count = counts.pop(0)
+        leftover = isinstance(count, str)
+        count = int(count.rstrip("+")) if leftover else count
         if count == 1:
             return multicard.Split("single")
         if count > multicard.MAX_CARDS:
@@ -578,7 +580,7 @@ def fake_split(*counts):
             crop = work_dir / f"candidate-{index:03d}.jpg"
             crop.write_bytes(b"crop")
             crops.append(crop)
-        return multicard.Split("split", tuple(crops), count)
+        return multicard.Split("split", tuple(crops), count, leftover=leftover)
     return detect
 
 
@@ -614,6 +616,22 @@ class MulticardTelegramTest(unittest.TestCase):
         with patch.object(pipeline, "save_contact", lambda d, i, resource_name=None, checkpoint=None: saved.append(d.name) or SaveResult("created", "people/x", "uploaded", [], d.display_name)):
             self.run_updates([callback(9, f"ba:g:{group}")])
         self.assertEqual(sorted(saved), ["가", "나", "다"])
+
+    def test_text_outside_found_cards_warns_about_a_missing_card(self):
+        with patch.object(multicard, "detect", fake_split("2+")), \
+                patch.object(pipeline, "scan_front", fake_scan(["가", "나"])):
+            self.run_updates([photo_update(1, "a")])
+        self.assertEqual(len(cards.list_cards()), 2)
+        warnings = [mid for text, _, mid in self.tg.sent if "빠진 명함이 있으면 따로 보내주세요" in text]
+        self.assertEqual(len(warnings), 1)
+        self.assertFalse(any(mid == warnings[0] for _, _, mid in self.tg.edited))  # never overwritten
+        before = len(self.tg.sent)
+        with patch.object(multicard, "detect", fake_split("2+", 1)), \
+                patch.object(pipeline, "scan_front", fake_scan(["다", "라", "마"])):
+            self.run_updates([photo_update(2, "b", "G2"), photo_update(3, "c", "G2")])
+        album_warnings = [text for text, _, _ in self.tg.sent[before:] if "빠진 명함" in text]
+        self.assertEqual(len(album_warnings), 1)
+        self.assertTrue(album_warnings[0].startswith("[명함 "))
 
     def test_notice_failure_still_recognizes_every_split_card(self):
         def broken_edit(*args, **kwargs):

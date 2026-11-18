@@ -1,10 +1,14 @@
 // Apple Vision multi-card detector for photos that hold several business cards.
 //
 // usage: vision_cards <input-image> <output-dir>
+//        vision_cards --text <input-image>
 // Prints JSON {image_width, image_height, rectangles:[{index, box, confidence,
 // crop_path, corners}]}. Coordinates are normalized with a top-left origin;
 // corners are TL, TR, BR, BL. Each rectangle is perspective-corrected at the
 // input's native resolution. Filtering is done in bizcard_intake/multicard.py.
+// --text prints {"lines": [{"chars": N, "center": [x, y]}]} for every text line
+// Vision reads, including text far smaller than the OCR helper's default
+// minimum. Centers use the same oriented, top-left coordinates as corners.
 import Foundation
 import Vision
 import CoreImage
@@ -32,13 +36,17 @@ enum ProbeError: Error, CustomStringConvertible {
     }
 }
 
-func run() throws {
-    guard CommandLine.arguments.count == 3 else {
-        throw ProbeError.failure("usage: probe <input-image> <output-dir>")
-    }
-    let sourceURL = URL(fileURLWithPath: CommandLine.arguments[1])
-    let outputURL = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
-    guard let source = CGImageSourceCreateWithURL(sourceURL as CFURL, nil),
+struct TextLine: Encodable {
+    let chars: Int
+    let center: [Double]
+}
+
+struct TextResult: Encodable {
+    let lines: [TextLine]
+}
+
+func orientedImage(_ url: URL) throws -> (CIImage, CGImage) {
+    guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
           let decoded = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
         throw ProbeError.failure("cannot decode input image")
     }
@@ -50,10 +58,42 @@ func run() throws {
     let oriented = CIImage(cgImage: decoded).oriented(forExifOrientation: orientation)
     let image = oriented.transformed(by: CGAffineTransform(
         translationX: -oriented.extent.minX, y: -oriented.extent.minY))
-    let context = CIContext()
-    guard let visionImage = context.createCGImage(image, from: image.extent) else {
+    guard let rendered = CIContext().createCGImage(image, from: image.extent) else {
         throw ProbeError.failure("cannot render oriented input image")
     }
+    return (image, rendered)
+}
+
+func readText(_ url: URL) throws {
+    let (_, visionImage) = try orientedImage(url)
+    let request = VNRecognizeTextRequest()
+    request.recognitionLevel = .accurate
+    request.usesLanguageCorrection = false
+    request.recognitionLanguages = ["ko-KR", "en-US"]
+    request.minimumTextHeight = 0.004  // card text in a whole-table photo is about 1% of the height
+    try VNImageRequestHandler(cgImage: visionImage, orientation: .up).perform([request])
+    let lines = (request.results ?? []).map { observation in
+        TextLine(
+            chars: observation.topCandidates(1).first?.string.filter { !$0.isWhitespace }.count ?? 0,
+            center: [Double(observation.boundingBox.midX), Double(1 - observation.boundingBox.midY)])
+    }
+    let encoded = try JSONEncoder().encode(TextResult(lines: lines))
+    FileHandle.standardOutput.write(encoded)
+    FileHandle.standardOutput.write(Data([10]))
+}
+
+func run() throws {
+    if CommandLine.arguments.count == 3 && CommandLine.arguments[1] == "--text" {
+        try readText(URL(fileURLWithPath: CommandLine.arguments[2]))
+        return
+    }
+    guard CommandLine.arguments.count == 3 else {
+        throw ProbeError.failure("usage: probe <input-image> <output-dir>")
+    }
+    let sourceURL = URL(fileURLWithPath: CommandLine.arguments[1])
+    let outputURL = URL(fileURLWithPath: CommandLine.arguments[2], isDirectory: true)
+    let (image, visionImage) = try orientedImage(sourceURL)
+    let context = CIContext()
     let width = visionImage.width
     let height = visionImage.height
     let request = VNDetectRectanglesRequest()

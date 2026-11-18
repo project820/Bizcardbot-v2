@@ -859,6 +859,13 @@ def _handle_multicard(token: str, chat_id: int, card: dict, front_path: Path,
                 cards.save_state("groups", state)
         except Exception:
             log.exception("multicard notice failed card=%s; recognizing anyway", card["id"])
+    if split.leftover:
+        # A separate message: the status message above later becomes the summary.
+        try:
+            send_message(token, chat_id, f"{prefix}사진에서 명함 {len(members)}장을 찾았습니다. "
+                                         "명함 밖에도 글씨가 보입니다. 빠진 명함이 있으면 따로 보내주세요.")
+        except Exception:
+            log.exception("multicard missing-card notice failed card=%s", card["id"])
     for member, target in zip(members, targets):
         submit(_recognize_and_show, token, chat_id, member, target, None, True, group=group)
     if not album:
