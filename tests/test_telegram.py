@@ -606,16 +606,26 @@ class MulticardTelegramTest(unittest.TestCase):
         self.assertTrue(group.startswith("split-"))
         self.assertTrue(all(c["media_group_id"] == group for c in members))
         self.assertEqual(len(self.tg.photos), 3)
-        status_id = self.tg.sent[0][2]
         self.assertIn("명함 3장을 찾았습니다", self.tg.edited[0][0])
-        summary, markup, edited_id = self.tg.edited[-1]
-        self.assertEqual(edited_id, status_id)
+        self.assertEqual(len(self.tg.edited), 1)  # the status message is not reused for the summary
+        summary, markup, summary_id = self.tg.sent[-1]
+        self.assertGreater(summary_id, max(mid for _, _, mid in self.tg.photos))  # last message in the chat
         self.assertIn("보낸 명함 3건", summary)
+        self.assertIn("아래 버튼을 누르면 한 번에 저장합니다", summary)
         self.assertEqual(markup["inline_keyboard"][0][0]["callback_data"], f"ba:g:{group}")
         saved = []
         with patch.object(pipeline, "save_contact", lambda d, i, resource_name=None, checkpoint=None: saved.append(d.name) or SaveResult("created", "people/x", "uploaded", [], d.display_name)):
             self.run_updates([callback(9, f"ba:g:{group}")])
         self.assertEqual(sorted(saved), ["가", "나", "다"])
+
+    def test_late_progress_update_never_overwrites_a_split_summary(self):
+        with patch.object(multicard, "detect", fake_split(2)), \
+                patch.object(pipeline, "scan_front", fake_scan(["가", "나"])):
+            self.run_updates([photo_update(1, "a")])
+        group = cards.list_cards()[0]["media_group_id"]
+        edits = len(self.tg.edited)
+        telegram._update_group_progress((42, group))
+        self.assertEqual(len(self.tg.edited), edits)
 
     def test_text_outside_found_cards_warns_about_a_missing_card(self):
         with patch.object(multicard, "detect", fake_split("2+")), \

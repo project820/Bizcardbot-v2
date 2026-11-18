@@ -303,6 +303,8 @@ def _group_job_done(group: tuple[int, str]) -> None:
 
 
 def _update_group_progress(group: tuple[int, str]) -> None:
+    if group[1].startswith("split-"):
+        return  # split photos have no progress message; never edit their summary
     members = cards.group_cards(group[0], group[1])
     done = sum(1 for c in members if c.get("status") != "processing")
     with _summary_lock:
@@ -852,15 +854,11 @@ def _handle_multicard(token: str, chat_id: int, card: dict, front_path: Path,
             if status_id is not None:
                 edit_message(token, chat_id, status_id, notice)
             else:
-                status_id = send_status(token, chat_id, notice)
-            with _summary_lock:
-                state = cards.load_state("groups")
-                state[f"{group[0]}:{group[1]}"] = status_id
-                cards.save_state("groups", state)
+                send_status(token, chat_id, notice)
         except Exception:
             log.exception("multicard notice failed card=%s; recognizing anyway", card["id"])
     if split.leftover:
-        # A separate message: the status message above later becomes the summary.
+        # A separate message so later summary edits never remove the warning.
         try:
             send_message(token, chat_id, f"{prefix}사진에서 명함 {len(members)}장을 찾았습니다. "
                                          "명함 밖에도 글씨가 보입니다. 빠진 명함이 있으면 따로 보내주세요.")
@@ -1018,6 +1016,9 @@ def _send_group_summary(token: str, chat_id: int, media_group_id: str) -> None:
     if len(members) < 2:
         return
     text, markup = batch_summary(members, f"g:{media_group_id}", "보낸 명함")
+    if media_group_id.startswith("split-") and markup:
+        # Split photos get the summary as the last message, after every draft.
+        text += "\n\n초안을 확인한 뒤 아래 버튼을 누르면 한 번에 저장합니다."
     state = cards.load_state("groups")
     key = f"{chat_id}:{media_group_id}"
     message_id = state.get(key)
