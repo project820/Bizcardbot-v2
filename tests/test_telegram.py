@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch
 from urllib.error import URLError
 
-from bizcard_intake import cards, chat_ux, doctor, pipeline, telegram
+from bizcard_intake import cards, chat_ux, doctor, multicard, pipeline, telegram
 from bizcard_intake.contacts import SaveResult
 from bizcard_intake.draft import CardDraft
 
@@ -558,6 +558,135 @@ class TelegramTest(unittest.TestCase):
             telegram.get_updates("token", 5)
         self.assertEqual(seen["timeout"], telegram.LONG_POLL_SECONDS)
         self.assertGreater(seen["timeout_arg"], telegram.LONG_POLL_SECONDS)
+
+
+def fake_split(*counts):
+    """Pretend each received photo holds this many cards, in update order."""
+    counts = list(counts)
+
+    def detect(source, work_dir):
+        count = counts.pop(0)
+        if count == 1:
+            return multicard.Split("single")
+        if count > multicard.MAX_CARDS:
+            return multicard.Split("too_many", count=count)
+        if count < 0:
+            return multicard.Split("too_small", count=-count)
+        work_dir.mkdir(parents=True, exist_ok=True)
+        crops = []
+        for index in range(count):
+            crop = work_dir / f"candidate-{index:03d}.jpg"
+            crop.write_bytes(b"crop")
+            crops.append(crop)
+        return multicard.Split("split", tuple(crops), count)
+    return detect
+
+
+class MulticardTelegramTest(unittest.TestCase):
+    setUp = TelegramTest.setUp
+    tearDown = TelegramTest.tearDown
+    run_updates = TelegramTest.run_updates
+
+    def front_dir(self):
+        return self.tmp / "photos" / "42" / "front"
+
+    def test_three_cards_in_one_photo_become_three_drafts_with_batch_save(self):
+        with patch.object(multicard, "detect", fake_split(3)), \
+                patch.object(pipeline, "scan_front", fake_scan(["가", "나", "다"])):
+            self.run_updates([photo_update(1, "a")])
+        members = cards.list_cards()
+        self.assertEqual(len(members), 3)
+        fronts = [Path(c["images"]["front"]) for c in members]
+        self.assertEqual(len({p.stem for p in fronts}), 3)
+        self.assertTrue(all(p.exists() for p in fronts))
+        self.assertEqual(sorted(p.name for p in self.front_dir().iterdir()), sorted(p.name for p in fronts))
+        group = members[0]["media_group_id"]
+        self.assertTrue(group.startswith("split-"))
+        self.assertTrue(all(c["media_group_id"] == group for c in members))
+        self.assertEqual(len(self.tg.photos), 3)
+        status_id = self.tg.sent[0][2]
+        self.assertIn("명함 3장을 찾았습니다", self.tg.edited[0][0])
+        summary, markup, edited_id = self.tg.edited[-1]
+        self.assertEqual(edited_id, status_id)
+        self.assertIn("보낸 명함 3건", summary)
+        self.assertEqual(markup["inline_keyboard"][0][0]["callback_data"], f"ba:g:{group}")
+        saved = []
+        with patch.object(pipeline, "save_contact", lambda d, i, resource_name=None, checkpoint=None: saved.append(d.name) or SaveResult("created", "people/x", "uploaded", [], d.display_name)):
+            self.run_updates([callback(9, f"ba:g:{group}")])
+        self.assertEqual(sorted(saved), ["가", "나", "다"])
+
+    def test_notice_failure_still_recognizes_every_split_card(self):
+        def broken_edit(*args, **kwargs):
+            raise URLError("deleted status message")
+        with patch.object(multicard, "detect", fake_split(3)), \
+                patch.object(telegram, "edit_message", broken_edit), \
+                patch.object(pipeline, "scan_front", fake_scan(["가", "나", "다"])):
+            self.run_updates([photo_update(1, "a")])
+        self.assertEqual(sorted(c["status"] for c in cards.list_cards()), ["review"] * 3)
+
+    def test_every_split_card_keeps_its_crop_before_recognition_starts(self):
+        queued = []
+        with patch.object(multicard, "detect", fake_split(3)), \
+                patch.object(telegram, "_recognize_and_show", lambda *args: queued.append(args)):
+            self.run_updates([photo_update(1, "a")])
+        self.assertEqual(len(queued), 3)
+        for card in cards.list_cards():
+            self.assertTrue(Path(card["images"]["front"]).exists())
+
+    def test_more_than_four_cards_asks_for_four_or_fewer_with_help_button(self):
+        with patch.object(multicard, "detect", fake_split(5)), \
+                patch.object(pipeline, "scan_front", side_effect=AssertionError("no OCR when refused")):
+            self.run_updates([photo_update(1, "a")])
+        [card] = cards.list_cards()
+        self.assertEqual(card["status"], "cancelled")
+        text, markup, _ = self.tg.edited[-1]
+        self.assertIn("명함이 5장 보입니다", text)
+        self.assertIn("4장 이하", text)
+        self.assertEqual(markup["inline_keyboard"][0][0]["callback_data"], "mh")
+        self.assertEqual(list(self.front_dir().iterdir()), [])
+        self.run_updates([callback(2, "mh")])
+        self.assertIn("HD", self.tg.sent[-1][0])
+
+    def test_small_cards_ask_for_hd_or_file(self):
+        with patch.object(multicard, "detect", fake_split(-3)), \
+                patch.object(pipeline, "scan_front", side_effect=AssertionError("no OCR when refused")):
+            self.run_updates([photo_update(1, "a")])
+        [card] = cards.list_cards()
+        self.assertEqual(card["status"], "cancelled")
+        text, markup, _ = self.tg.edited[-1]
+        self.assertIn("HD 화질이나 파일로", text)
+        self.assertEqual(markup["inline_keyboard"][0][0]["callback_data"], "mh")
+
+    def test_single_card_keeps_the_original_photo_and_path(self):
+        with patch.object(multicard, "detect", fake_split(1)), \
+                patch.object(pipeline, "scan_front", fake_scan(["가"])):
+            self.run_updates([photo_update(1, "a")])
+        [card] = cards.list_cards()
+        self.assertIsNone(card["media_group_id"])
+        self.assertEqual(Path(card["images"]["front"]).name, f"{card['id']}_a.jpg")
+
+    def test_back_photo_skips_detection(self):
+        with patch.object(pipeline, "scan_front", fake_scan(["가"])):
+            self.run_updates([photo_update(1, "a")])
+        [card] = cards.list_cards()
+        self.run_updates([callback(2, f"bk:{card['id']}")])
+        prompt_id = self.tg.sent[-1][2]
+        with patch.object(multicard, "detect", side_effect=AssertionError("back photo must not split")), \
+                patch.object(pipeline, "recognize_back", lambda c, path: c):
+            self.run_updates([photo_update(3, "back", reply_to=prompt_id)])
+        self.assertEqual(len(cards.list_cards()), 1)
+
+    def test_album_photo_with_two_cards_joins_the_album_summary(self):
+        with patch.object(multicard, "detect", fake_split(2, 1)), \
+                patch.object(pipeline, "scan_front", fake_scan(["가", "나", "다"])):
+            self.run_updates([photo_update(1, "a", "G1"), photo_update(2, "b", "G1")])
+        members = cards.list_cards()
+        self.assertEqual(len(members), 3)
+        self.assertTrue(all(c["media_group_id"] == "G1" for c in members))
+        self.assertEqual(len(self.tg.photos), 3)
+        summary, markup, _ = self.tg.edited[-1]
+        self.assertIn("보낸 명함 3건", summary)
+        self.assertEqual(markup["inline_keyboard"][0][0]["callback_data"], "ba:g:G1")
 
 
 if __name__ == "__main__":

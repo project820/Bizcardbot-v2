@@ -44,6 +44,7 @@ class OcrLine:
 @dataclass(frozen=True)
 class OcrResult:
     lines: tuple[OcrLine, ...]
+    failed: bool = False  # the helper did not run to completion; empty lines are not proof of no text
 
     @property
     def text(self) -> str:
@@ -92,7 +93,7 @@ def _point(value) -> tuple[float, float] | None:
 def extract_text(image_path: Path) -> OcrResult:
     binary = _ensure_vision_ocr()
     if binary is None:
-        return OcrResult(())
+        return OcrResult((), failed=True)
 
     try:
         completed = subprocess.run(
@@ -104,17 +105,17 @@ def extract_text(image_path: Path) -> OcrResult:
         )
     except Exception:
         log.exception("vision_ocr subprocess failed")
-        return OcrResult(())
+        return OcrResult((), failed=True)
 
     if completed.returncode != 0:
         log.warning("vision_ocr failed: %s", completed.stderr.strip())
-        return OcrResult(())
+        return OcrResult((), failed=True)
 
     try:
         rows = json.loads(completed.stdout)
     except json.JSONDecodeError:
         log.warning("vision_ocr returned non-json output")
-        return OcrResult(())
+        return OcrResult((), failed=True)
 
     lines = tuple(
         OcrLine(

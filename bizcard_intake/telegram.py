@@ -9,6 +9,7 @@ import secrets
 import logging
 import logging.handlers
 import os
+import shutil
 import threading
 import time
 import uuid
@@ -19,7 +20,7 @@ from urllib.parse import quote, urlencode
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
-from . import cards, contact_backend as contacts, doctor, pipeline
+from . import cards, contact_backend as contacts, doctor, multicard, pipeline
 from . import apple_contacts
 from .chat_ux import HELP_TEXT, HELP_WORDS, LIST_WORDS, batch_summary, edit_prompt, save_result_text, select_card, followup_text
 from .pipeline import DATA_DIR, LOG_DIR
@@ -779,6 +780,95 @@ def process_front_photo(token: str, chat_id: int, photos: list, data_dir: Path, 
         else:
             send_message(token, chat_id, text)
         return
+    if _handle_multicard(token, chat_id, card, front_path, status_id, album):
+        return
+    _recognize_and_show(token, chat_id, card, front_path, status_id, album)
+
+
+MULTICARD_HELP = (
+    "한 사진에 명함 여러 장을 보낼 때\n"
+    "1. 한 사진에 명함은 4장까지 넣어주세요.\n"
+    "2. HD로 보내기: 사진을 고른 뒤 화질 표시(SD)를 눌러 HD로 바꿔 보내세요.\n"
+    "3. 파일로 보내기: 클립 버튼 → 파일 → 사진을 골라 보내세요.\n"
+    "명함이 사진을 크게 차지할수록 잘 읽힙니다."
+)
+
+
+def multicard_help_buttons() -> dict:
+    return {"inline_keyboard": [[{"text": "HD·파일로 보내는 방법", "callback_data": "mh"}]]}
+
+
+def _handle_multicard(token: str, chat_id: int, card: dict, front_path: Path,
+                      status_id: Optional[int], album: bool) -> bool:
+    """Split a photo of two to four cards into one card each. False keeps the one-card path."""
+    work_dir = front_path.parent / f"{card['id']}_split"
+    split = multicard.detect(front_path, work_dir)
+    if split.kind == "single":
+        return False
+    prefix = f"{cards.label(card)} " if album else ""
+    if split.kind != "split":
+        log.info("multicard refused card=%s kind=%s count=%s", card["id"], split.kind, split.count)
+        pipeline.cancel(card)
+        pipeline.cleanup_paths(front_path)
+        if split.kind == "too_many":
+            text = f"{prefix}명함이 {split.count}장 보입니다. 한 사진에 {multicard.MAX_CARDS}장 이하로 다시 보내주세요."
+        else:
+            text = f"{prefix}명함 글씨가 작게 찍혔습니다. HD 화질이나 파일로 다시 보내주세요."
+        if status_id is not None:
+            edit_message(token, chat_id, status_id, text, reply_markup=multicard_help_buttons())
+        else:
+            send_message(token, chat_id, text, reply_markup=multicard_help_buttons())
+        return True
+    log.info("multicard split card=%s count=%s", card["id"], split.count)
+    if album and card.get("media_group_id"):
+        group = (chat_id, str(card["media_group_id"]))
+    else:
+        group = (chat_id, f"split-{card['id']}")
+    members = [card]
+    for _ in split.crops[1:]:
+        members.append(cards.new_card(chat_id, media_group_id=group[1], caption=str(card.get("caption") or "")))
+    targets = []
+    for index, (member, crop) in enumerate(zip(members, split.crops), 1):
+        # Derived images are named from the source stem, so each card needs its own.
+        target = front_path.parent / f"{member['id']}_card{index}.jpg"
+        os.replace(crop, target)
+        targets.append(target)
+    # Every crop is recorded before the original goes, so a restart can retry each card.
+    with pipeline.card_lock(card["id"]):
+        fresh = cards.load_card(card["id"]) or card
+        fresh["media_group_id"] = group[1]
+        fresh["images"]["front"] = str(targets[0])
+        cards.save_card(fresh)
+        card.clear()
+        card.update(fresh)
+    for member, target in zip(members[1:], targets[1:]):
+        member["images"]["front"] = str(target)
+        cards.save_card(member)
+    shutil.rmtree(work_dir, ignore_errors=True)
+    pipeline.cleanup_paths(front_path)
+    if not album:
+        notice = f"사진에서 명함 {len(members)}장을 찾았습니다. 명함마다 사진과 초안이 하나씩 옵니다."
+        try:
+            if status_id is not None:
+                edit_message(token, chat_id, status_id, notice)
+            else:
+                status_id = send_status(token, chat_id, notice)
+            with _summary_lock:
+                state = cards.load_state("groups")
+                state[f"{group[0]}:{group[1]}"] = status_id
+                cards.save_state("groups", state)
+        except Exception:
+            log.exception("multicard notice failed card=%s; recognizing anyway", card["id"])
+    for member, target in zip(members, targets):
+        submit(_recognize_and_show, token, chat_id, member, target, None, True, group=group)
+    if not album:
+        _request_group_summary(group)
+    return True
+
+
+@_report_stale_write
+def _recognize_and_show(token: str, chat_id: int, card: dict, front_path: Path,
+                        status_id: Optional[int] = None, album: bool = False) -> None:
     try:
         pipeline.recognize_front(card, front_path)
     except (pipeline.ContactSaveError, cards.StaleCardState) as exc:
@@ -1012,6 +1102,9 @@ def handle_callback(token: str, callback: dict, chat_id: int) -> None:
     data = str(callback.get("data") or "")
     log.info("callback chat=%s data=%s", chat_id, data)
     action, _, rest = data.partition(":")
+    if action == "mh":
+        send_message(token, chat_id, MULTICARD_HELP)
+        return
     if action in ("na", "nc", "ex"):
         if chat_id not in allowed_chat_ids():
             return
