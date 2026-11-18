@@ -1,17 +1,169 @@
+<p align="center">
+  <img src="docs/assets/hero.jpg" alt="텔레그램으로 보낸 명함 사진과 명함비서 봇의 초안, 저장 버튼" width="100%">
+</p>
+
 # Bizcardbot-v2
 
-명함 사진을 Telegram으로 보내면 선택한 연락처 계정에 저장하는 봇이다.
-내 Mac에서 실행하고, 저장 전에 초안을 보여 준다.
-필요한 것은 켜 둔 Mac과 Telegram이다.
+명함 사진을 텔레그램으로 보내면 내 Mac이 읽고 연락처에 저장한다.
+저장 전에 초안을 보여 주고, 버튼으로 저장하거나 고친다.
+명함 1장의 AI 비용은 약 1원이다(API 키 2개 기준).
 
-ChatGPT나 Claude 구독, 또는 별도 과금되는 OpenAI API 키도 필요하다.
-Mac 연락처에서 Google 계정을 선택하면 Google Cloud 설정 없이 동기화한다.
-기존 무료 `gws` 직접 연결도 지원한다.
+현재 버전: **2.3.1** · [Quick start](#quick-start) · [새 소식](#새-소식-whats-new) · [변경 기록](CHANGELOG.md)
 
-처음 설치는 [Quick start](#quick-start)를 따른다.
+## 이렇게 쓴다
+
+1. 명함 사진을 봇에게 보낸다. 사진에 캡션을 달면 만남 메모가 된다.
+2. 초안을 확인하고 `저장`을 누른다. 틀린 곳은 초안에 답장해 고친다.
+3. 명함 사진과 메모가 연락처에 들어간다. 3일 뒤 봇이 인사말과 함께 연락할지 묻는다.
+
+<p align="center">
+  <img src="docs/assets/saved.png" alt="저장 완료 메시지, 3일 뒤 후속 연락 알림, 명함 사진과 만남 메모가 들어간 연락처" width="100%">
+</p>
+
+예시 이미지의 인물, 회사, 연락처는 모두 가상이다.
+
+| 기능 | 내용 |
+| --- | --- |
+| 방향 보정 | 비뚤거나 뒤집힌 사진을 펴고 바로 세운다. |
+| 종이색 정리 | 누렇거나 푸른 종이를 하얗게 맞춘 사진을 연락처에 넣는다. |
+| 교차 확인 | API 키가 2개면 두 AI 모델이 따로 읽고 OCR과 맞춰 본다. |
+| 언어 | 한국어, 영어, 가로쓰기 일본어·중국어 명함을 읽는다. |
+| 저장 위치 | Mac 연락처(iCloud·Google 계정) 또는 Google 직접 연결 |
+| 이직·승진 | 같은 사람의 새 명함이면 기존 연락처 갱신을 제안한다. |
+| 후속 연락 | 저장 3일 뒤 복사할 인사말을 보낸다. |
+| 내보내기 | `CSV 내보내기` 버튼으로 저장한 명함을 내려받는다. |
+
+## 작동 흐름
+
+```mermaid
+flowchart TD
+  A[텔레그램으로 명함 사진] --> B[Apple Vision<br/>명함 펴기 · 방향 보정 · OCR]
+  B -->|API 키 2개| C[Luna와 Haiku<br/>동시 판독]
+  B -->|OpenAI 키만| D[Luna 판독]
+  B -->|OpenAI 키 없음| E[codex · claude CLI 판독]
+  C --> F[OCR과 대조해 합치기]
+  D --> G[초안과 버튼 전송]
+  E --> G
+  F --> G
+  G -->|답장으로 수정| G
+  G -->|뒷면 추가 · 인식 재시도| B
+  G -->|취소| X[종료]
+  G -->|저장| H[연락처 저장<br/>명함 사진 · 메모 포함]
+  H --> I[3일 뒤 후속 연락 알림]
+```
+
+글자 인식(OCR)과 사진 정리는 Mac 안에서 한다.
+처음 판독할 때 AI 모델에는 사진과 OCR 글자를 보낸다.
+뒷면 병합에는 앞뒤 초안을, AI 수정에는 초안과 수정 답장을 보낸다.
+자세한 범위는 [Privacy](#privacy)에 있다.
+
+## 설치 흐름
+
+<p align="center">
+  <img src="docs/assets/setup.png" alt="터미널의 setup-telegram 안내와 텔레그램 설치 도우미의 명함봇 만들기 버튼" width="100%">
+</p>
+
+```mermaid
+flowchart TD
+  A[저장소 내려받기<br/>git clone] --> B[패키지 설치<br/>pip install]
+  B --> C[텔레그램 봇 만들기<br/>setup-telegram]
+  C -->|기본| D[설치 도우미에서<br/>▶ 명함봇 만들기]
+  C -->|수동| E[BotFather에서<br/>직접 만들기]
+  D --> F[6자리 코드 입력]
+  E --> G[확인 단어 보내기]
+  F --> H[AI 판독 연결<br/>API 키 또는 CLI 로그인]
+  G --> H
+  H --> I[연락처 연결 고르기<br/>setup-contacts]
+  I -->|Mac 연락처| J[저장할 계정 고르기]
+  I -->|Google 직접| K[gws 로그인]
+  J --> L[봇 실행<br/>start_bot.sh]
+  K --> L
+```
+
+필요한 것은 켜 둔 Mac과 텔레그램이다.
+AI 판독에는 OpenAI API 키나 ChatGPT·Claude 구독(CLI) 중 하나가 필요하다.
+Anthropic 키는 OpenAI 키와 함께 있을 때 교차 확인에 쓴다.
+Mac 연락처에서 Google 계정을 고르면 Google Cloud 설정 없이 동기화한다.
+
+명령과 순서는 [Quick start](#quick-start)에 있다.
 v1 사용자는 [업그레이드 방법](CHANGELOG.md)을 따른다.
 
-현재 버전: **2.3.0**
+## 명함 1장 비용
+
+명함 1장의 AI 비용은 토큰 사용량 실측으로 계산한 약 0.9~1.2원이다.
+청구서와 대조한 금액은 아니다.
+
+OCR은 Mac의 Apple Vision이 하므로 비용이 없다.
+비용은 AI 모델(Luna, Haiku) 호출에서 생긴다.
+아래 수치는 단면 명함을 처음 판독하는 비용이다.
+
+| 측정 | 1장 비용 |
+| --- | ---: |
+| 운영 Mac 실기 시험, 시험 명함 1장 2회 (2026-11-18) | 0.89~0.95원 |
+| 실제 명함 17장 평균, 캐시 적용 (2026-11-17) | 약 0.96원 |
+| 실제 명함 17장 평균, 캐시 없음 가정 | 약 1.16원 |
+
+캐시 적용 값은 Luna 입력의 약 99.8%를 캐시에서 읽은 기록이다.
+운영 중 캐시 적중률은 확인하지 않았다.
+
+| 한 달 인식 장수(단면, 재인식·AI 수정 없음) | 예상 AI 비용 |
+| --- | ---: |
+| 30장 | 약 29~35원 |
+| 100장 | 약 96~116원 |
+| 300장 | 약 288~348원 |
+
+월 비용은 실제 명함 17장의 두 평균(0.96원, 1.16원)으로 계산했다.
+
+- 기본 교차 확인 기준이다. `OPENAI_API_KEY`와 `ANTHROPIC_API_KEY`가 모두 있어야 한다.
+- OpenAI 키만 있으면 Luna만 호출한다. 이때는 1장에 약 0.20~0.40원이다.
+- codex·claude CLI 방식은 이 계산에 들지 않는다.
+- 환율 1달러 1,335원과 2026-11-17 확인 단가로 계산했다. 세금과 환전 수수료는 뺐다.
+- Mac 전기료는 넣지 않았다. 텔레그램은 무료다.
+- 비용은 글자 양과 캐시 적중에 따라 달라진다.
+- 양면 명함은 앞뒤 판독에 병합 호출 1번이 더 든다. 총비용은 측정하지 않았다.
+- 답장 문장으로 고치면(AI 수정) 호출마다 비용이 더 든다. `항목: 값` 형식 수정은 AI를 쓰지 않는다.
+- 봇은 비용을 토큰 사용량으로 계산해 기록한다.
+- 사진 1번 인식 비용이 기준(기본 2원, `BIZCARD_COST_WARN_KRW`)을 넘으면 초안에 한 번 표시한다. AI 수정 비용은 이 기준에 넣지 않는다.
+- `CSV 내보내기` 안내에 저장한 명함의 평균 비용이 나온다.
+  평균에는 앞면·뒷면·AI 수정 비용이 모두 들어간다.
+  비용 기록이 있는 명함만 계산한다. 기록이 하나도 없으면 평균을 숨긴다.
+
+## 새 소식 (What's new)
+
+- **v2.3.1**은 문서 패치다. README를 예시 이미지와 흐름도로 다시 구성하고 [명함 1장 비용](#명함-1장-비용) 절을 추가한다.
+  봇 동작은 v2.3.0과 같다. v2.3.0보다 오래된 버전은 [v2.3.0 업그레이드 방법](CHANGELOG.md#230---2026-11-18)을 먼저 따른다.
+- **v2.3.0**은 만남 메모, CSV 내보내기, AI 비용 기록, 주소 판독 비교, 수정 없이 저장 비율을 추가한다.
+  Mac 연락처 방식은 처음 한 번 Mac 화면에서 '허용'을 눌러야 메모가 들어간다.
+  [v2.3.0 새 기능](#v230-새-기능)과 [업그레이드와 설정 변경](CHANGELOG.md#230---2026-11-18)을 확인한다.
+- **v2.2.0**은 일본어·중국어 명함 인식과 이직·승진 갱신 선택을 추가한다.
+  저장 후 기본 3일 뒤에 복사할 인사말과 후속 연락 알림을 제공한다.
+  [업그레이드와 설정 변경](CHANGELOG.md#220---2026-11-17)을 확인한다.
+- **v2.1.1**은 릴리스 노트 링크와 공개 전 검사를 고친 패치다. 봇 동작은 v2.1.0과 같다.
+- **v2.1.0**은 Mac 연락처 저장과 계정 선택을 추가한다.
+  `python3 -m bizcard_intake setup-contacts`로 연결 방식을 고른다.
+
+<details>
+<summary>v2.0.0 변경 내용</summary>
+
+- **v2.0.0**은 새 저장소로 옮긴 첫 정식 버전이다.
+- 명함 방향을 자동으로 바로잡는다. 명함 17장을 네 방향으로 돌린 68건을 모두 바로잡았다.
+  다른 사진에서는 결과가 다를 수 있다.
+- 연락처 사진의 종이색을 스캐너처럼 하얗게 맞춘다. 푸르거나 누렇게 찍힌 명함도 깨끗하게 저장된다.
+  금색·검정처럼 진한 색 명함은 그대로 둔다.
+- 명함 1장 처리 시간은 중앙값 약 4.5초→4.0초로 줄었다(17장 1회 측정, 네트워크 변동 포함).
+  두 번째 확인 모델(Haiku)의 응답을 짧게 줄였다(중앙값 3.4초→2.8초).
+  17장 비교에서 연락처 값 손실은 관측되지 않았다.
+- `setup-telegram`으로 봇 생성과 허용 사용자 설정을 안내한다. 수동 경로도 지원한다.
+- 봇 시작 스크립트와 CLI는 `.env`를 설정 값으로만 읽는다.
+- 같은 봇이 다른 곳에서도 실행되면 봇 사용자에게 Telegram 메시지로 알린다.
+  토큰 도용일 때도 같은 알림이 온다.
+- Cloud 미리보기는 배포 전이다. 변경과 이전 방법은 [CHANGELOG](CHANGELOG.md)를 확인한다.
+
+</details>
+
+기여자는 [버전 관리와 릴리스 규칙](RELEASING.md)을 따른다.
+`python3 scripts/release.py history`는 Git 전체 이력의 개인정보 패턴과 이미지 파일을 검사한다.
+README 그림은 `docs/assets/public-images.txt`에 등록한 파일만 허용한다.
 
 ## v2.3.0 새 기능
 
@@ -67,42 +219,6 @@ CLI 대체 실행과 미지원 모델의 비용은 알 수 없어 경고하지 �
 CSV의 비용과 비율은 기록이 있는 명함을 기준으로 계산한다.
 XLSX와 Google Sheets 내보내기는 지원하지 않는다.
 
-## 새 소식 (What's new)
-
-- **v2.3.0**은 만남 메모, CSV 내보내기, AI 비용 기록, 주소 판독 비교, 수정 없이 저장 비율을 추가한다.
-  Mac 연락처 방식은 처음 한 번 Mac 화면에서 '허용'을 눌러야 메모가 들어간다.
-  [v2.3.0 새 기능](#v230-새-기능)과 [업그레이드와 설정 변경](CHANGELOG.md#230---2026-11-18)을 확인한다.
-- **v2.2.0**은 일본어·중국어 명함 인식과 이직·승진 갱신 선택을 추가한다.
-  저장 후 기본 3일 뒤에 복사할 인사말과 후속 연락 알림을 제공한다.
-  [업그레이드와 설정 변경](CHANGELOG.md#220---2026-11-17)을 확인한다.
-- **v2.1.1**은 릴리스 노트 링크와 공개 전 검사를 고친 패치다. 봇 동작은 v2.1.0과 같다.
-- **v2.1.0**은 Mac 연락처 저장과 계정 선택을 추가한다.
-  `python3 -m bizcard_intake setup-contacts`로 연결 방식을 고른다.
-
-- **v2.0.0**은 새 저장소로 옮긴 첫 정식 버전이다.
-- 명함 방향을 자동으로 바로잡는다. 명함 17장을 네 방향으로 돌린 68건을 모두 바로잡았다.
-  다른 사진에서는 결과가 다를 수 있다.
-- 연락처 사진의 종이색을 스캐너처럼 하얗게 맞춘다. 푸르거나 누렇게 찍힌 명함도 깨끗하게 저장된다.
-  금색·검정처럼 진한 색 명함은 그대로 둔다.
-- 명함 1장 처리 시간은 중앙값 약 4.5초→4.0초로 줄었다(17장 1회 측정, 네트워크 변동 포함).
-  두 번째 확인 모델(Haiku)의 응답을 짧게 줄였다(중앙값 3.4초→2.8초).
-  17장 비교에서 연락처 값 손실은 관측되지 않았다.
-- `setup-telegram`으로 봇 생성과 허용 사용자 설정을 안내한다. 수동 경로도 지원한다.
-- 봇 시작 스크립트와 CLI는 `.env`를 설정 값으로만 읽는다.
-- 같은 봇이 다른 곳에서도 실행되면 봇 사용자에게 Telegram 메시지로 알린다.
-  토큰 도용일 때도 같은 알림이 온다.
-- Cloud 미리보기는 배포 전이다. 변경과 이전 방법은 [CHANGELOG](CHANGELOG.md)를 확인한다.
-
-기여자는 [버전 관리와 릴리스 규칙](RELEASING.md)을 따른다.
-`python3 scripts/release.py history`는 Git 전체 이력의 개인정보 패턴과 이미지 파일을 검사한다.
-
-```
-photo ─▶ Apple Vision rectify + OCR ─▶ codex / claude (JSON) ─▶ draft in Telegram
-                                                                    │ reply to fix, 승인 to save
-                                                                    ▼
-                                                        Mac Contacts / Google Contacts (with card photo)
-```
-
 ## Prerequisites
 
 | Requirement | Why | Check |
@@ -134,6 +250,7 @@ Then, in order:
    The installer saves its token and your allowed chat ID in
    `.env` with owner-only permissions. Existing allowed chats are kept.
 2. Add `OPENAI_API_KEY=` to `.env` if you want the API parser.
+   Add `ANTHROPIC_API_KEY=` as well to turn on the Luna + Haiku cross-check.
 3. Run `python3 -m bizcard_intake setup` to choose a contacts backend and check the parser.
    CLI commands read the project's `.env` as data; process environment values take precedence.
 4. Start the bot: `./scripts/start_bot.sh`. The script reads `.env` automatically.
@@ -383,20 +500,6 @@ that cannot read the key deletes `credentials.enc`.
    - 휴대전화: 010-5555-0101
    ...
    ```
-   Only one bot or mutating CLI command can run per data directory.
-   While the bot runs, use Telegram for changes; `doctor` and `list` remain
-   available. `list` no longer migrates legacy records.
-   `doctor` reports whether the writer lock is held or free without changing it.
-   Bot startup polls for up to 20 seconds while the previous writer exits.
-   If still held, startup fails with a Korean message.
-   Lookup completion retries card-lock contention on its worker for up to 30
-   seconds, then restores normal save buttons without a job-change suggestion.
-   A save request may bypass a pending lookup at least 20 seconds old or one
-   without a start timestamp. Restart
-   recovery clears leftover lookup flags. Confirmation buttons are acknowledged
-   before their work starts.
-   Cancellation during recognition takes effect when recognition finishes and
-   survives restart. Other actions on a busy card receive an immediate notice.
    Buttons: 저장 · 직접 수정 · 뒷면 추가 · 인식 재시도 · 취소. For an album the bot
    also sends a summary with "저장 가능한 N건 모두 저장".
    Horizontal Japanese and Chinese cards are supported. The Korean recognition
@@ -411,32 +514,6 @@ that cannot read the key deletes `credentials.enc`.
    `휴대전화: 010-1234-5678`, `팩스: -` to clear). These are applied as typed,
    without the AI, and survive re-recognition and back-side merges. Free text
    ("이메일은 kim@acme.com") still goes through the AI reviser.
-   Reply selection retains v2.1.1 behavior, using the last 20 message IDs per
-   card. Sender/date metadata does not change selection. An unresolved reply
-   falls back to the single reviewable card. A TEXT reply resolving to a
-   saved/cancelled card gets the existing closed-state notice and is not edited.
-   Photo replies keep v2.1.1 back-side selection: even a reply to a closed card
-   can add a back side to another card waiting for one.
-   Delivered messages are registered in memory immediately. As in v2.1.1,
-   the calling thread waits for the card lock and writes the message ID.
-   It reloads the card, appends the ID only if absent, and keeps the last 20 IDs.
-   The temporary entry is removed when the write attempt ends, including errors.
-   Replies during the wait resolve through that entry to the original card.
-   Lock waits and disk writes block the caller; recording on the update loop
-   can delay other chats. OCR and AI recognition do not hold the card lock.
-   A failed write or a crash before persistence can lose the reference.
-   As in v2.1.1, replying to an unrecorded saved card A can select the
-   sole reviewable card B. Reply to a verified draft message.
-   Cards are processed in parallel (`BIZCARD_WORKERS`, default 30): the model
-   calls for every card in an album run at the same time, image prep and OCR
-   use at most one slot per CPU core, and saves run in the background so buttons
-   stay responsive. 30 real cards took 7 s from upload to finished drafts. An
-   album gets one progress message (later the summary with "모두 저장") and one
-   photo+draft message per card; messages to a chat are spaced out and
-   Telegram's 429 retry_after is honoured. Batch saves go to Google one contact
-   at a time (Google's guidance for one user) and share a single address-book
-   scan. A per-card lock keeps double taps,
-   batch saves and automatic retries from saving the same card twice.
 3. `목록` lists every card that is not saved yet, with a save-all button.
 4. If Google is unreachable or logged out, the card is kept as "저장 보류" and
    saved automatically once Google works again (backoff from 2 minutes up to 6
@@ -467,6 +544,53 @@ that cannot read the key deletes `credentials.enc`.
    produces a warning in `doctor`. Use `Asia/Seoul`, not `KST`.
    Set `BIZCARD_FOLLOWUP_DAYS=0` in `.env` to disable them, or change `3` to the
    number of days you prefer, then restart the bot.
+
+<details>
+<summary>Concurrency, reply selection and parallel processing</summary>
+
+Only one bot or mutating CLI command can run per data directory.
+While the bot runs, use Telegram for changes; `doctor` and `list` remain
+available. `list` no longer migrates legacy records.
+`doctor` reports whether the writer lock is held or free without changing it.
+Bot startup polls for up to 20 seconds while the previous writer exits.
+If still held, startup fails with a Korean message.
+Lookup completion retries card-lock contention on its worker for up to 30
+seconds, then restores normal save buttons without a job-change suggestion.
+A save request may bypass a pending lookup at least 20 seconds old or one
+without a start timestamp. Restart
+recovery clears leftover lookup flags. Confirmation buttons are acknowledged
+before their work starts.
+Cancellation during recognition takes effect when recognition finishes and
+survives restart. Other actions on a busy card receive an immediate notice.
+
+Reply selection retains v2.1.1 behavior, using the last 20 message IDs per
+card. Sender/date metadata does not change selection. An unresolved reply
+falls back to the single reviewable card. A TEXT reply resolving to a
+saved/cancelled card gets the existing closed-state notice and is not edited.
+Photo replies keep v2.1.1 back-side selection: even a reply to a closed card
+can add a back side to another card waiting for one.
+Delivered messages are registered in memory immediately. As in v2.1.1,
+the calling thread waits for the card lock and writes the message ID.
+It reloads the card, appends the ID only if absent, and keeps the last 20 IDs.
+The temporary entry is removed when the write attempt ends, including errors.
+Replies during the wait resolve through that entry to the original card.
+Lock waits and disk writes block the caller; recording on the update loop
+can delay other chats. OCR and AI recognition do not hold the card lock.
+A failed write or a crash before persistence can lose the reference.
+As in v2.1.1, replying to an unrecorded saved card A can select the
+sole reviewable card B. Reply to a verified draft message.
+Cards are processed in parallel (`BIZCARD_WORKERS`, default 30): the model
+calls for every card in an album run at the same time, image prep and OCR
+use at most one slot per CPU core, and saves run in the background so buttons
+stay responsive. 30 real cards took 7 s from upload to finished drafts. An
+album gets one progress message (later the summary with "모두 저장") and one
+photo+draft message per card; messages to a chat are spaced out and
+Telegram's 429 retry_after is honoured. Batch saves go to Google one contact
+at a time (Google's guidance for one user) and share a single address-book
+scan. A per-card lock keeps double taps,
+batch saves and automatic retries from saving the same card twice.
+
+</details>
 
 | Reminder button | Action |
 | --- | --- |

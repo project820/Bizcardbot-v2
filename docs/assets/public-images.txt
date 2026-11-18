@@ -1,0 +1,6 @@
+# Reviewed public README images only.
+# Format: <40-character git blob SHA-1>  <repository-relative path under docs/assets/>
+# Add or update with: python3 scripts/release.py allow-image docs/assets/example.png
+2a114e8527353f4b7baedf3de91f53b1f03501e3  docs/assets/hero.jpg
+e811e393c173166273b9cfec3d4adddf0eb67753  docs/assets/saved.png
+b3569502c27e3cf5de7e0ccd516a871a36c5c5df  docs/assets/setup.png

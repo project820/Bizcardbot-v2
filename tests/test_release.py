@@ -160,6 +160,26 @@ class ReleaseTest(unittest.TestCase):
                 (self.root / "binary.dat").write_bytes(b"safe\n")
                 self.assertEqual(self.module().scan_public_files(self.root), [])
 
+    def test_index_scan_checks_staged_images_behind_clean_worktree(self):
+        module = self.module()
+        subprocess.run(["git", "init", "--quiet"], cwd=self.root, check=True, capture_output=True)
+        target = self.root / "docs/assets/demo.jpg"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        staged = b"\xff\xd8\0" + b"sk-" + b"staged-image" * 3 + b"\n"
+        clean = b"\xff\xd8\0" + b"123456789:" + b"A" * 35 + b"\n"
+        target.write_bytes(staged)
+        subprocess.run(["git", "add", "--", "docs/assets/demo.jpg"], cwd=self.root, check=True, capture_output=True)
+        target.write_bytes(clean)
+        self.write("docs/assets/public-images.txt",
+                   f"{module.git_blob_sha1(staged)}  docs/assets/demo.jpg\n"
+                   f"{module.git_blob_sha1(clean)}  docs/assets/demo.jpg\n")
+        problems = module.scan_public_files(self.root)
+        self.assertTrue(any("API 비밀키" in p and "(Git 인덱스)" in p for p in problems), problems)
+        self.assertFalse(any("Telegram" in p for p in problems), problems)
+        subprocess.run(["git", "add", "--", "docs/assets/demo.jpg"], cwd=self.root, check=True, capture_output=True)
+        problems = [p for p in module.scan_public_files(self.root) if p.startswith("docs/assets/demo.jpg")]
+        self.assertEqual(problems, [])
+
     def test_history_reports_patterns_and_images_without_values_and_deduplicates_blobs(self):
         module = self.module()
         first, second = "a" * 40, "b" * 40
@@ -213,6 +233,171 @@ class ReleaseTest(unittest.TestCase):
         with patch.object(module, "run_git", side_effect=lambda root, *args: replies[args]), redirect_stdout(stdout), redirect_stderr(stderr):
             result = module.main(["history"], root=self.root)
         self.assertEqual(result, 0, stdout.getvalue() + stderr.getvalue())
+
+    def image_history(self, filename, blob, content="\0image"):
+        module = self.module()
+        commit = "a" * 40
+        replies = {("rev-list", "--all"): commit + "\n",
+                   ("ls-tree", "-r", "-z", commit): f"100644 blob {blob}\t{filename}\0",
+                   ("cat-file", "blob", blob): content}
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with patch.object(module, "run_git", side_effect=lambda root, *args: replies[args]), redirect_stdout(stdout), redirect_stderr(stderr):
+            result = module.main(["history"], root=self.root)
+        return result, stdout.getvalue() + stderr.getvalue()
+
+    def test_history_allows_only_exact_public_image_path_and_blob(self):
+        blob = "b" * 40
+        self.write("docs/assets/public-images.txt", f"# Reviewed public images\n\n{blob}  docs/assets/demo.png\n")
+        result, output = self.image_history("docs/assets/demo.png", blob)
+        self.assertEqual(result, 0, output)
+        for filename, actual_blob in (("docs/assets/demo.png", "c" * 40),
+                                      ("docs/assets/other.png", blob)):
+            with self.subTest(filename=filename, blob=actual_blob):
+                result, output = self.image_history(filename, actual_blob)
+                self.assertEqual(result, 1, output)
+                self.assertIn("이미지 파일", output)
+
+    def test_history_allows_every_reviewed_version_of_the_same_image(self):
+        old, new = "b" * 40, "c" * 40
+        self.write("docs/assets/public-images.txt", f"{old}  docs/assets/demo.png\n{new}  docs/assets/demo.png\n")
+        for blob in (old, new):
+            with self.subTest(blob=blob[:1]):
+                result, output = self.image_history("docs/assets/demo.png", blob)
+                self.assertEqual(result, 0, output)
+        result, output = self.image_history("docs/assets/demo.png", "d" * 40)
+        self.assertEqual(result, 1, output)
+
+    def test_allowed_image_does_not_bypass_secret_scan(self):
+        blob = "b" * 40
+        self.write("docs/assets/public-images.txt", f"{blob}  docs/assets/demo.png\n")
+        result, output = self.image_history("docs/assets/demo.png", blob, "sk-" + "secret-fixture" * 4)
+        self.assertEqual(result, 1, output)
+        self.assertIn("API 비밀키", output)
+        self.assertNotIn("이미지 파일", output)
+
+    def test_check_skips_only_reviewed_binary_image_with_token_shaped_bytes(self):
+        module = self.module()
+        image = b"\xff\xd8\0" + b"123456789:" + b"A" * 35 + b"\n"
+        target = self.root / "docs/assets/demo.jpg"
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+        def reset(data=image):
+            for leftover in target.parent.glob("*.jpg"):
+                leftover.unlink()
+            target.write_bytes(image)
+            self.write("docs/assets/public-images.txt", f"{module.git_blob_sha1(data)}  docs/assets/demo.jpg\n")
+
+        reset()
+        result, output = self.run_command("check", "--allow-dirty", dirty=True)
+        self.assertEqual(result, 0, output)
+        text_image = b"123456789:" + b"A" * 35 + b"\n"
+        cases = (("changed bytes", image + b"x", "docs/assets/demo.jpg", image),
+                 ("unlisted path", image, "docs/assets/other.jpg", image),
+                 ("text content", text_image, "docs/assets/demo.jpg", text_image))
+        for label, data, filename, listed in cases:
+            with self.subTest(label):
+                reset(listed)
+                target.unlink()
+                (self.root / filename).write_bytes(data)
+                result, output = self.run_command("check", "--allow-dirty", dirty=True)
+                self.assertEqual(result, 1, output)
+                self.assertIn(f"{filename}:", output)
+                self.assertIn("Telegram 봇 토큰", output)
+
+    def test_check_rejects_unreviewed_images_and_metadata_secrets(self):
+        module = self.module()
+        image = b"\xff\xd8\0image"
+        for filename in ("docs/assets/unlisted.png", "private/card.jpg"):
+            with self.subTest(filename=filename):
+                target = self.root / filename
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(image)
+                result, output = self.run_command("check", "--allow-dirty", dirty=True)
+                self.assertEqual(result, 1, output)
+                self.assertIn(f"{filename}: 검토하지 않은 이미지 파일이다", output)
+                target.unlink()
+        leaked = b"\xff\xd8\0" + b"/" + b"Users/private-owner/photo\n"
+        target = self.root / "docs/assets/demo.jpg"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(leaked)
+        self.write("docs/assets/public-images.txt", f"{module.git_blob_sha1(leaked)}  docs/assets/demo.jpg\n")
+        result, output = self.run_command("check", "--allow-dirty", dirty=True)
+        self.assertEqual(result, 1, output)
+        self.assertIn("개인 로컬 경로", output)
+        self.assertNotIn("검토하지 않은 이미지", output)
+
+    def test_check_and_history_reject_invalid_public_image_entries(self):
+        blob = "b" * 40
+        entries = (f"{blob}  private/card.png", f"{blob}  docs/assets/../card.png",
+                   f"{blob}  /docs/assets/card.png", f"{blob}  docs/assets//card.png",
+                   f"{blob}  docs/assets", f"{blob} docs/assets/card.png",
+                   "bad-hash  docs/assets/card.png", f"{'g' * 40}  docs/assets/card.png")
+        for entry in entries:
+            with self.subTest(entry=entry):
+                self.write("docs/assets/public-images.txt", "# Public images\n" + entry + "\n")
+                for result, output in (self.run_command("check"),
+                                       self.image_history("file.txt", blob)):
+                    self.assertEqual(result, 1, output)
+                    self.assertIn("docs/assets/public-images.txt:2", output)
+
+    def test_history_reports_additional_image_extensions(self):
+        for suffix in (".jpeg", ".WEBP", ".gif"):
+            with self.subTest(suffix=suffix):
+                result, output = self.image_history("card" + suffix, "b" * 40)
+                self.assertEqual(result, 1, output)
+                self.assertIn("이미지 파일", output)
+
+    def test_allow_image_adds_and_updates_actual_blob_preserving_other_entries(self):
+        module = self.module()
+        subprocess.run(["git", "init", "--quiet"], cwd=self.root, check=True, capture_output=True)
+        filename = "docs/assets/demo image.png"
+        target = self.root / filename
+        self.write(filename, "first image\n")
+        other = f"{'c' * 40}  docs/assets/other.png\n"
+        self.write("docs/assets/public-images.txt", "# Reviewed images\n\n" + other)
+        hashes = []
+        for content in (b"first image\n", b"updated image\n", b"updated image\n"):
+            with self.subTest(content=content):
+                target.write_bytes(content)
+                expected = subprocess.run(["git", "hash-object", "--", filename], cwd=self.root,
+                                          check=True, capture_output=True, text=True).stdout.strip()
+                with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                    result = module.main(["allow-image", filename], root=self.root)
+                self.assertEqual(result, 0)
+                text = (self.root / "docs/assets/public-images.txt").read_text()
+                self.assertTrue(text.startswith("# Reviewed images\n\n"))
+                self.assertIn(other, text)
+                if expected not in hashes:
+                    hashes.append(expected)
+                self.assertEqual(text.count("  " + filename + "\n"), len(hashes))
+                for kept in hashes:
+                    self.assertIn(f"{kept}  {filename}\n", text)
+
+    def test_allow_image_creates_allowlist(self):
+        module = self.module()
+        subprocess.run(["git", "init", "--quiet"], cwd=self.root, check=True, capture_output=True)
+        filename = "docs/assets/demo.png"
+        self.write(filename, "demo\n")
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            result = module.main(["allow-image", filename], root=self.root)
+        self.assertEqual(result, 0)
+        expected = subprocess.run(["git", "hash-object", "--", filename], cwd=self.root,
+                                  check=True, capture_output=True, text=True).stdout.strip()
+        self.assertEqual((self.root / "docs/assets/public-images.txt").read_text(),
+                         f"{expected}  {filename}\n")
+
+    def test_allow_image_rejects_outside_missing_and_symlink_paths_without_writes(self):
+        module = self.module()
+        self.write("private/card.png", "private image\n")
+        self.write("docs/assets/public-images.txt", "# Keep this unchanged\n")
+        (self.root / "docs/assets/link.png").symlink_to(self.root / "private/card.png")
+        original = (self.root / "docs/assets/public-images.txt").read_bytes()
+        for filename in ("private/card.png", "docs/assets/../../private/card.png",
+                         str(self.root / "private/card.png"), "docs/assets/missing.png",
+                         "docs/assets/link.png"):
+            with self.subTest(filename=filename), redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                self.assertEqual(module.main(["allow-image", filename], root=self.root), 1)
+                self.assertEqual((self.root / "docs/assets/public-images.txt").read_bytes(), original)
 
     def test_history_redacts_secrets_in_filenames(self):
         module = self.module()
